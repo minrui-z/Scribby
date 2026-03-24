@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+python-dotenv
+huggingface-hub
+whisperx
+# 平台特定依賴（由 install.py 自動安裝）：
+# macOS Apple Silicon: mlx-whisper
+# Windows / 其他: faster-whisper

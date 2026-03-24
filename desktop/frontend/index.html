@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>逐字搞定 Beta</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-top"></div>
+  <div class="ambient ambient-bottom"></div>
+
+  <button id="settings-fab" class="fab" title="開啟設定">
+    <span>設定</span>
+  </button>
+
+  <button id="compact-add-btn" class="fab secondary fade-toggle is-hidden" title="新增音訊檔案">
+    <span>+</span>
+  </button>
+
+  <div id="settings-overlay" class="overlay hidden"></div>
+
+  <aside id="settings-drawer" class="drawer">
+    <div class="drawer-header">
+      <h2>設定</h2>
+      <button id="close-settings-btn" class="icon-btn" title="關閉">×</button>
+    </div>
+
+    <section class="drawer-section">
+      <label class="toggle-row">
+        <input type="checkbox" id="diarize-toggle">
+        <span>語者分離</span>
+      </label>
+      <p class="hint-text">自動辨識不同說話者並標記</p>
+    </section>
+
+    <section id="diarize-options" class="drawer-section settings-collapsible is-collapsed" aria-hidden="true">
+      <div class="settings-stack">
+        <div class="form-field">
+          <label class="field-label" for="num-speakers">說話人數</label>
+          <select id="num-speakers" class="input">
+            <option value="0">自動偵測</option>
+            <option value="2">2 人</option>
+            <option value="3">3 人</option>
+            <option value="4">4 人</option>
+            <option value="5">5 人</option>
+            <option value="6">6 人</option>
+            <option value="7">7 人</option>
+            <option value="8">8 人</option>
+            <option value="9">9 人</option>
+            <option value="10">10 人</option>
+          </select>
+        </div>
+
+        <div class="form-field">
+          <label class="field-label" for="hf-token">HuggingFace Token</label>
+          <input type="password" id="hf-token" class="input" placeholder="hf_...">
+        </div>
+
+        <div class="form-field compact">
+          <button id="verify-btn" class="button secondary full">驗證 Token</button>
+          <p id="token-status" class="status-text hidden"></p>
+        </div>
+      </div>
+    </section>
+  </aside>
+
+  <div class="app-shell">
+    <header class="app-header" data-tauri-drag-region>
+      <div class="header-copy">
+        <h1>逐字搞定 Beta</h1>
+        <p class="subtitle">語音轉譯</p>
+      </div>
+
+      <section id="live-window" class="live-window hero-live fade-toggle is-hidden">
+        <div class="live-pill">
+          <span class="pulse-dot"></span>
+          <p id="live-title">正在聆聽...</p>
+        </div>
+      </section>
+    </header>
+
+    <main class="content">
+      <section id="drop-zone" class="drop-zone collapsible-panel">
+        <p class="drop-title">加入音訊檔案</p>
+        <p class="drop-copy">點擊選取需要轉譯的檔案，可一次加入多個音訊檔。</p>
+        <button id="pick-files-btn" class="button primary">選取音訊檔</button>
+      </section>
+
+      <section id="settings-hint" class="settings-hint collapsible-panel">
+        <button id="open-settings-inline-btn" class="hint-button">
+          需要語者分離？點此開啟設定並填入 HuggingFace Token
+        </button>
+      </section>
+
+      <section id="queue-section" class="panel hidden">
+        <div class="panel-head">
+          <p class="section-label">檔案序列</p>
+          <button id="clear-queue-btn" class="link-btn">清除全部</button>
+        </div>
+        <div id="queue-list" class="queue-list"></div>
+        <div class="control-row">
+          <button id="start-btn" class="button primary grow">開始轉譯</button>
+          <button id="pause-btn" class="button secondary hidden">暫停</button>
+          <button id="stop-btn" class="button danger hidden">停止</button>
+        </div>
+        <p id="action-status" class="hint-text action-status hidden"></p>
+        <p id="batch-note" class="hint-text hidden"></p>
+      </section>
+
+      <section id="results-section" class="panel hidden">
+        <div class="panel-head">
+          <p class="section-label">結果</p>
+          <button id="download-all-btn" class="link-btn hidden">下載全部</button>
+        </div>
+        <div id="results-list" class="results-list"></div>
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <p>桌面版本地執行 · Beta 測試版 · 音訊不會離開您的電腦</p>
+      <p>Developed by 莊旻叡</p>
+    </footer>
+  </div>
+
+  <div id="live-stream-layer" class="live-stream-layer hidden">
+    <div id="live-stream" class="live-stream"></div>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

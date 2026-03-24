@@ -1,0 +1,23 @@
+{
+  "name": "zhuzigaoding-desktop",
+  "private": true,
+  "version": "0.1.0-beta.1",
+  "type": "module",
+  "scripts": {
+    "prepare:python-runtime": "cd ../.. && venv/bin/python desktop/prepare_python_runtime.py --clean",
+    "prepare:ffmpeg-runtime": "cd ../.. && venv/bin/python desktop/prepare_ffmpeg_runtime.py --clean",
+    "smoke:bundle": "cd ../.. && venv/bin/python desktop/smoke_test_desktop_bundle.py",
+    "dev:web": "vite --config vite.config.js",
+    "build:web": "vite build --config vite.config.js",
+    "dev": "tauri dev",
+    "build": "npm run prepare:python-runtime && npm run prepare:ffmpeg-runtime && tauri build && npm run smoke:bundle",
+    "release:bundle": "npm run smoke:bundle && cd ../.. && venv/bin/python desktop/create_release_bundle.py --clean"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "vite": "^5.4.10"
+  }
+}

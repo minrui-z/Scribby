@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+
+venv/
+.env
+
+desktop/runtime/
+desktop/tauri/node_modules/
+desktop/tauri/src-tauri/target/
+
+release/
+dist/
+build/
