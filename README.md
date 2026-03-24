@@ -1,16 +1,22 @@
 # Scribby / 逐字搞定
 
+[![Download Beta](https://img.shields.io/badge/Download-Beta-1f1a17?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/minrui-z/Scribby/releases/tag/v0.1.0-beta.1)
+
 **Scribby** is a desktop transcription project for `macOS Apple Silicon`.  
 **逐字搞定** 是一個專為 `macOS Apple Silicon` 設計的桌面語音轉譯專案。
 
 ## Release
 
+- Latest beta release: [`v0.1.0-beta.1`](https://github.com/minrui-z/Scribby/releases/tag/v0.1.0-beta.1)
+- Download asset: [`Scribby-Beta-0.1.0-beta.1-macos-arm64.zip`](https://github.com/minrui-z/Scribby/releases/download/v0.1.0-beta.1/Scribby-Beta-0.1.0-beta.1-macos-arm64.zip)
 - GitHub Releases: <https://github.com/minrui-z/Scribby/releases>
-- Recommended distribution format: packaged `.app` from the Releases page
+- Recommended distribution format: packaged `.app` delivered via the release zip
 - Release line: `beta`
 
+- 最新 beta 版本：[`v0.1.0-beta.1`](https://github.com/minrui-z/Scribby/releases/tag/v0.1.0-beta.1)
+- 下載檔案：[`Scribby-Beta-0.1.0-beta.1-macos-arm64.zip`](https://github.com/minrui-z/Scribby/releases/download/v0.1.0-beta.1/Scribby-Beta-0.1.0-beta.1-macos-arm64.zip)
 - GitHub 發佈頁：<https://github.com/minrui-z/Scribby/releases>
-- 建議提供給使用者的版本：Releases 頁面中的已打包 `.app`
+- 建議提供給使用者的格式：透過 release zip 發佈的已打包 `.app`
 - 目前版本線：`beta`
 
 ## Status / 目前狀態
