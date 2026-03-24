@@ -3,12 +3,6 @@
 **Scribby** is a desktop transcription project for `macOS Apple Silicon`.  
 **逐字搞定** 是一個專為 `macOS Apple Silicon` 設計的桌面語音轉譯專案。
 
-It uses `Tauri + Python backend` to package local speech-to-text workflows into a real desktop app instead of exposing a browser-based localhost app.  
-它使用 `Tauri + Python backend`，把本地語音轉文字流程包成真正的桌面 App，而不是讓使用者面對瀏覽器中的 localhost 網頁。
-
-This repository contains the desktop app source only. It does not include the old web test version, bundled Python runtime, `node_modules`, or built `.app` artifacts.  
-這個 repository 只包含桌面版原始碼，不包含舊的 Web 測試版、內嵌 Python runtime、`node_modules` 或已打包的 `.app` 產物。
-
 ## Release
 
 - GitHub Releases: <https://github.com/minrui-z/Scribby/releases>
@@ -41,15 +35,6 @@ This repository contains the desktop app source only. It does not include the ol
 - 單檔 `.txt` 匯出與全部結果壓縮下載
 - 原生桌面視窗執行，不需手動開瀏覽器
 
-## Project Structure / 專案結構
-
-- [desktop/](desktop): desktop workspace / 桌面版工作區
-- [desktop/frontend/](desktop/frontend): desktop frontend / 桌面前端
-- [desktop/tauri/](desktop/tauri): Tauri shell and packaging / Tauri shell 與打包設定
-- [desktop/python_backend.py](desktop/python_backend.py): desktop Python backend / 桌面版 Python backend
-- [engine.py](engine.py): transcription core / 轉譯核心
-- [transcribe_worker.py](transcribe_worker.py): task worker / 任務 worker
-- [runtime_paths.py](runtime_paths.py): runtime path resolution / runtime 路徑解析
 
 ## Requirements / 開發需求
 
@@ -72,16 +57,6 @@ npm install
 npm run dev
 ```
 
-## Build / 打包
-
-```bash
-cd desktop/tauri
-npm run build
-npm run release:bundle
-```
-
-Release artifacts are collected into the root `release/` folder after bundling.  
-打包完成後，release 產物會整理到專案根目錄的 `release/`。
 
 ## Design Direction / 設計方向
 
