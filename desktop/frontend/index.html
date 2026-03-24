@@ -14,8 +14,8 @@
     <span>設定</span>
   </button>
 
-  <button id="compact-add-btn" class="fab secondary fade-toggle is-hidden" title="新增音訊檔案">
-    <span>+</span>
+  <button id="compact-add-btn" class="fab secondary fade-toggle is-hidden" title="請直接拖放音訊檔" type="button" disabled>
+    <span>拖放</span>
   </button>
 
   <div id="settings-overlay" class="overlay hidden"></div>
@@ -83,8 +83,8 @@
     <main class="content">
       <section id="drop-zone" class="drop-zone collapsible-panel">
         <p class="drop-title">加入音訊檔案</p>
-        <p class="drop-copy">點擊選取需要轉譯的檔案，可一次加入多個音訊檔。</p>
-        <button id="pick-files-btn" class="button primary">選取音訊檔</button>
+        <p class="drop-copy">請直接從 Finder 拖曳音訊檔到這裡。桌面版目前以拖放作為穩定入口。</p>
+        <p id="picker-status" class="hint-text picker-status hidden"></p>
       </section>
 
       <section id="settings-hint" class="settings-hint collapsible-panel">

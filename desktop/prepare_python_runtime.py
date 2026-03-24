@@ -29,74 +29,23 @@ FRAMEWORK_IGNORE = shutil.ignore_patterns(
     "*.pyo",
 )
 
-# Desktop app is macOS Apple Silicon only. Keep the dependency seeds broad enough
-# for MLX transcription + optional diarization, then resolve the runtime closure
-# from wheel metadata instead of copying all site-packages and deleting blindly.
+FRAMEWORK_BINARIES = ("python3", "python3.10")
+
+# Desktop app is macOS Apple Silicon only. Resolve the runtime from a narrow
+# dependency closure and manually add the tiny subset of WhisperX files used by
+# engine.diarize so the bundle does not carry the Faster-Whisper stack.
 SEED_DISTRIBUTIONS = (
     "mlx-whisper",
     "mlx",
-    "torch",
-    "torchaudio",
-    "numpy",
-    "scipy",
-    "pandas",
-    "matplotlib",
-    "whisperx",
     "pyannote-audio",
     "pyannote-core",
     "pyannote-database",
     "pyannote-metrics",
     "pyannote-pipeline",
-    "transformers",
     "huggingface-hub",
-    "tokenizers",
-    "safetensors",
-    "av",
-    "einops",
-    "omegaconf",
     "requests",
-    "pyyaml",
-    "tqdm",
-    "regex",
-    "joblib",
-    "threadpoolctl",
-    "scikit-learn",
-    "numba",
-    "llvmlite",
-    "pillow",
-    "networkx",
-    "sympy",
-    "fsspec",
-    "filelock",
     "packaging",
     "typing-extensions",
-    "python-dateutil",
-    "pytz",
-    "tzdata",
-    "markupsafe",
-    "jinja2",
-    "contourpy",
-    "cycler",
-    "fonttools",
-    "kiwisolver",
-    "primepy",
-    "asteroid-filterbanks",
-    "lightning",
-    "lightning-utilities",
-    "pytorch-lightning",
-    "torchmetrics",
-    "charset-normalizer",
-    "urllib3",
-    "idna",
-    "certifi",
-    "anyio",
-    "annotated-types",
-    "pydantic",
-    "pydantic-core",
-    "typing-inspection",
-    "platformdirs",
-    "hf-xet",
-    "pyannoteai-sdk",
 )
 
 SAFE_PRUNE_DIRECTORIES = (
@@ -105,6 +54,22 @@ SAFE_PRUNE_DIRECTORIES = (
     "mlx/include",
     "mlx/share",
 )
+
+MANUAL_PACKAGE_FILES: dict[str, tuple[str, ...]] = {
+    "whisperx": (
+        "__init__.py",
+        "audio.py",
+        "diarize.py",
+        "log_utils.py",
+        "schema.py",
+        "utils.py",
+    ),
+}
+
+EXCLUDED_DISTRIBUTIONS = {
+    "whisperx",
+    "torchcodec",
+}
 
 SKIP_DISTRIBUTION_FILE_SUFFIXES = (".pyc", ".pyo")
 SKIP_DISTRIBUTION_FILE_NAMES = {"RECORD"}
@@ -169,6 +134,9 @@ def resolve_distribution_closure(index: dict[str, Distribution]) -> dict[str, Di
         selected[name] = dist
         pending.extend(requirement_names(dist))
 
+    for name in EXCLUDED_DISTRIBUTIONS:
+        selected.pop(normalize_name(name), None)
+
     return selected
 
 
@@ -196,6 +164,25 @@ def copy_distribution_files(target_site_packages: Path, selected: dict[str, Dist
             if not source.exists() or source.is_dir():
                 continue
             target = target_site_packages / Path(rel_path)
+            copy_file(source, target)
+
+
+def copy_framework_binaries(target_bin: Path) -> None:
+    target_bin.mkdir(parents=True, exist_ok=True)
+    for name in FRAMEWORK_BINARIES:
+        copy_file(FRAMEWORK_ROOT / "bin" / name, target_bin / name)
+
+
+def copy_manual_package_files(target_site_packages: Path) -> None:
+    for package_name, entries in MANUAL_PACKAGE_FILES.items():
+        source_root = VENV_SITE_PACKAGES / package_name
+        if not source_root.exists():
+            raise SystemExit(f"找不到手動保留的套件目錄：{source_root}")
+        for entry in entries:
+            source = source_root / entry
+            if not source.exists():
+                raise SystemExit(f"找不到手動保留的套件檔案：{source}")
+            target = target_site_packages / package_name / entry
             copy_file(source, target)
 
 
@@ -228,14 +215,7 @@ def main() -> int:
 
     copy_file(FRAMEWORK_ROOT / "Python", STAGED_PYTHON / "Python")
     copy_file(FRAMEWORK_ROOT / "Resources" / "Info.plist", STAGED_PYTHON / "Resources" / "Info.plist")
-
-    shutil.copytree(
-        FRAMEWORK_ROOT / "bin",
-        STAGED_PYTHON / "bin",
-        symlinks=False,
-        ignore=FRAMEWORK_IGNORE,
-        dirs_exist_ok=True,
-    )
+    copy_framework_binaries(STAGED_PYTHON / "bin")
     shutil.copytree(
         FRAMEWORK_ROOT / "lib" / "python3.10",
         STAGED_PYTHON / "lib" / "python3.10",
@@ -250,6 +230,7 @@ def main() -> int:
     index = distribution_index()
     selected = resolve_distribution_closure(index)
     copy_distribution_files(target_site_packages, selected)
+    copy_manual_package_files(target_site_packages)
     prune_runtime_site_packages(target_site_packages)
 
     (STAGED_PYTHON / "README.txt").write_text(

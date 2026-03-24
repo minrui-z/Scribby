@@ -7,11 +7,13 @@ import tempfile
 import threading
 import time
 import uuid
+import gc
 from pathlib import Path
 from typing import Any, Callable
 
 import engine
 
+from desktop.adapters import mlx_runtime
 from desktop.adapters.file_export import transcript_filename, write_transcript, write_zip
 
 
@@ -49,10 +51,13 @@ class TranscriptionService:
             "speakers": 0,
             "token": "",
         }
+        self._mlx_policy: dict[str, Any] | None = None
 
     def get_info(self) -> dict[str, Any]:
         info = engine.get_engine_info()
         info["supports_hard_stop"] = info["engine"] != "mlx"
+        if self._mlx_policy:
+            info["mlx_memory_policy"] = self._mlx_policy
         return info
 
     def verify_token(self, token: str) -> dict[str, Any]:
@@ -284,12 +289,16 @@ class TranscriptionService:
 
     def _process_item_mlx(self, item: dict[str, Any]) -> None:
         options = self._last_options.copy()
+        self._ensure_mlx_policy()
 
         def on_progress(event_type: str, message: str) -> None:
             self._handle_progress_event(item, event_type, {"message": message, "type": event_type})
 
-        result = engine.transcribe(item["path"], language=options["language"], on_progress=on_progress)
-        self._finalize_item(item, result, options)
+        try:
+            result = self._run_mlx_transcription(item, options, on_progress)
+            self._finalize_item(item, result, options)
+        finally:
+            self._reclaim_mlx_memory(reset_peak=True)
 
     def _process_item_subprocess(self, item: dict[str, Any]) -> None:
         options = self._last_options.copy()
@@ -460,6 +469,51 @@ class TranscriptionService:
             {"fileId": item["fileId"], "result": item["result"]},
         )
         self.emit_event("queue_updated", snapshot)
+
+    def _ensure_mlx_policy(self) -> None:
+        if engine.ENGINE != "mlx" or self._mlx_policy is not None:
+            return
+        self._mlx_policy = mlx_runtime.configure_memory_policy()
+
+    def _reclaim_mlx_memory(self, reset_peak: bool = False) -> dict[str, Any] | None:
+        if engine.ENGINE != "mlx":
+            return None
+        stats = mlx_runtime.reclaim_memory(reset_peak=reset_peak)
+        gc.collect()
+        if self._mlx_policy is not None:
+            self._mlx_policy["last_memory_stats"] = stats
+        return stats
+
+    def _memory_limit_error(self, exc: BaseException) -> RuntimeError:
+        stats = self._reclaim_mlx_memory(reset_peak=False) or {}
+        peak = int(stats.get("peak_memory_bytes", 0) / (1024**3) * 10) / 10 if stats else 0
+        message = "桌面版記憶體上限已觸發，已嘗試回收記憶體並重試一次仍失敗。"
+        if peak:
+            message += f" 本次峰值約 {peak:.1f} GB。"
+        message += " 請改成分批處理較長音檔。"
+        return RuntimeError(message)
+
+    def _run_mlx_transcription(
+        self,
+        item: dict[str, Any],
+        options: dict[str, Any],
+        on_progress: Callable[[str, str], None],
+    ) -> dict[str, Any]:
+        try:
+            return engine.transcribe(item["path"], language=options["language"], on_progress=on_progress)
+        except Exception as exc:
+            if not mlx_runtime.is_memory_pressure_error(exc):
+                raise
+
+            on_progress("status", "正在回收 MLX 記憶體並重新嘗試...")
+            self._reclaim_mlx_memory(reset_peak=False)
+
+            try:
+                return engine.transcribe(item["path"], language=options["language"], on_progress=on_progress)
+            except Exception as retry_exc:
+                if mlx_runtime.is_memory_pressure_error(retry_exc):
+                    raise self._memory_limit_error(retry_exc) from retry_exc
+                raise
 
     def _snapshot_locked(self) -> dict[str, Any]:
         return {

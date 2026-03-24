@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 const state = {
   items: [],
@@ -11,6 +12,7 @@ const state = {
   tokenVerified: false,
   liveMessageQueue: [],
   liveMessageTimer: null,
+  isDraggingFiles: false,
 };
 
 const els = {};
@@ -27,7 +29,6 @@ function cacheElements() {
     "settings-overlay",
     "settings-drawer",
     "close-settings-btn",
-    "pick-files-btn",
     "open-settings-inline-btn",
     "diarize-toggle",
     "diarize-options",
@@ -36,6 +37,7 @@ function cacheElements() {
     "verify-btn",
     "token-status",
     "drop-zone",
+    "picker-status",
     "settings-hint",
     "live-window",
     "live-title",
@@ -59,6 +61,26 @@ function cacheElements() {
 
 async function backendCommand(command, args = {}) {
   return invoke("backend_command", { command, args });
+}
+
+async function pickAudioFilesDialog() {
+  return invoke("pick_audio_files");
+}
+
+async function pickAudioFilesDialogA() {
+  return invoke("pick_audio_files_a");
+}
+
+async function pickAudioFilesDialogB() {
+  return invoke("pick_audio_files_b");
+}
+
+async function pickSaveResultPath(suggestedFilename) {
+  return invoke("pick_save_result_path", { suggestedFilename });
+}
+
+async function pickSaveAllResultsPath() {
+  return invoke("pick_save_all_results_path");
 }
 
 function normalizeQueueState(snapshot) {
@@ -207,11 +229,57 @@ function setActionStatus(message = "", tone = "") {
   }
 }
 
+function setPickerStatus(message = "", tone = "") {
+  if (!els["picker-status"]) return;
+  const hasMessage = Boolean(String(message || "").trim());
+  els["picker-status"].textContent = hasMessage ? String(message) : "";
+  els["picker-status"].classList.toggle("hidden", !hasMessage);
+  els["picker-status"].classList.remove("success", "error");
+  if (hasMessage && tone) {
+    els["picker-status"].classList.add(tone);
+  }
+}
+
 function setDiarizeOptionsVisible(visible) {
   const section = els["diarize-options"];
   if (!section) return;
   section.classList.toggle("is-collapsed", !visible);
   section.setAttribute("aria-hidden", visible ? "false" : "true");
+}
+
+async function enqueuePaths(paths, sourceLabel = "檔案") {
+  const normalized = Array.isArray(paths)
+    ? paths.map((path) => String(path || "").trim()).filter(Boolean)
+    : [];
+  if (!normalized.length) {
+    return;
+  }
+
+  setPickerStatus(`已取得 ${normalized.length} 個${sourceLabel}`, "success");
+  setActionStatus(`已選取 ${normalized.length} 個檔案，正在加入序列...`);
+  applyQueueState(optimisticQueuedState(normalized));
+
+  const result = await withTimeout(
+    backendCommand("enqueue_files", { paths: normalized }),
+    8000,
+    "加入檔案",
+  );
+
+  if (result.queue || result.state) {
+    applyQueueState(result.queue ?? result.state);
+    setActionStatus(`已加入 ${normalized.length} 個檔案`, "success");
+    setPickerStatus("");
+    return;
+  }
+
+  if (result.queued) {
+    applyQueueState(mergeQueuedItems(result.queued));
+    setActionStatus(`已加入 ${result.queued.length} 個檔案`, "success");
+    setPickerStatus("");
+    return;
+  }
+
+  throw new Error("加入檔案後沒有收到可更新的序列資料");
 }
 
 function renderQueue() {
@@ -299,10 +367,13 @@ function renderResults() {
       const fileId = button.dataset.fileId;
       const suggestedFilename = decodeURIComponent(button.dataset.filename || "");
       try {
-        const saved = await invoke("save_result", { fileId, suggestedFilename });
-        if (saved) {
-          setActionStatus(`已下載 ${suggestedFilename}`, "success");
-        }
+        const destination = await pickSaveResultPath(suggestedFilename);
+        if (!destination) return;
+        await backendCommand("save_result", {
+          file_id: fileId,
+          destination_path: destination,
+        });
+        setActionStatus(`已下載 ${suggestedFilename}`, "success");
       } catch (error) {
         setActionStatus(`下載失敗: ${error?.message || error}`, "error");
         window.alert(`下載失敗: ${error?.message || error}`);
@@ -428,32 +499,54 @@ async function loadInfo() {
 }
 
 async function pickFiles() {
+  return pickFilesVariant("default");
+}
+
+async function pickFilesVariant(variant = "default") {
   try {
-    const paths = await invoke("pick_audio_files");
-    if (!paths || paths.length === 0) return;
-    setActionStatus(`已選取 ${paths.length} 個檔案，正在加入序列...`);
-    applyQueueState(optimisticQueuedState(paths));
-    const result = await withTimeout(
-      backendCommand("enqueue_files", { paths }),
-      8000,
-      "加入檔案",
+    const variantLabels = {
+      default: "預設",
+      a: "A / GitHub 原版",
+      b: "B / 目前版本",
+    };
+    const variantLabel = variantLabels[variant] || variantLabels.default;
+    setPickerStatus(`正在開啟選檔視窗...（${variantLabel}）`);
+    const picked = await (
+      variant === "a"
+        ? pickAudioFilesDialogA()
+        : variant === "b"
+          ? pickAudioFilesDialogB()
+          : pickAudioFilesDialog()
     );
-    if (result.queue || result.state) {
-      applyQueueState(result.queue ?? result.state);
-      setActionStatus(`已加入 ${paths.length} 個檔案`, "success");
+    const paths = Array.isArray(picked) ? picked : [];
+    if (!paths || paths.length === 0) {
+      setPickerStatus(`已取消選取。 (${variantLabel})`);
       return;
     }
-    if (result.queued) {
-      applyQueueState(mergeQueuedItems(result.queued));
-      setActionStatus(`已加入 ${result.queued.length} 個檔案`, "success");
-      return;
-    }
-    throw new Error("加入檔案後沒有收到可更新的序列資料");
+    await enqueuePaths(paths, `${variantLabel}音訊檔`);
   } catch (error) {
     console.error(error);
+    setPickerStatus(`選檔失敗: ${error?.message || error}`, "error");
     setActionStatus(`加入音訊檔案失敗: ${error?.message || error}`, "error");
     window.alert(`加入音訊檔案失敗: ${error?.message || error}`);
   }
+}
+
+window.__scribbyPickFiles = () => {
+  void pickFilesVariant("default");
+};
+
+window.__scribbyPickFilesA = () => {
+  void pickFilesVariant("a");
+};
+
+window.__scribbyPickFilesB = () => {
+  void pickFilesVariant("b");
+};
+
+function updateDropZoneDragState(active) {
+  state.isDraggingFiles = active;
+  els["drop-zone"]?.classList.toggle("is-drag-target", active);
 }
 
 async function verifyToken() {
@@ -541,10 +634,13 @@ async function downloadAll() {
   const fileIds = state.items.filter((item) => item.status === "done").map((item) => item.fileId);
   if (fileIds.length === 0) return;
   try {
-    const saved = await invoke("save_all_results", { fileIds });
-    if (saved) {
-      setActionStatus("已下載全部結果", "success");
-    }
+    const destination = await pickSaveAllResultsPath();
+    if (!destination) return;
+    await backendCommand("save_all_results", {
+      file_ids: fileIds,
+      destination_path: destination,
+    });
+    setActionStatus("已下載全部結果", "success");
   } catch (error) {
     setActionStatus(`下載全部失敗: ${error?.message || error}`, "error");
     window.alert(`下載全部失敗: ${error?.message || error}`);
@@ -556,15 +652,6 @@ function bindEvents() {
   els["open-settings-inline-btn"].addEventListener("click", openSettings);
   els["close-settings-btn"].addEventListener("click", closeSettings);
   els["settings-overlay"].addEventListener("click", closeSettings);
-  els["pick-files-btn"].addEventListener("click", (event) => {
-    event.stopPropagation();
-    void pickFiles();
-  });
-  els["drop-zone"].addEventListener("click", (event) => {
-    if (event.target.closest("button")) return;
-    void pickFiles();
-  });
-  els["compact-add-btn"].addEventListener("click", pickFiles);
   els["verify-btn"].addEventListener("click", verifyToken);
   els["start-btn"].addEventListener("click", (event) => {
     event.preventDefault();
@@ -661,11 +748,50 @@ async function bindBackendEvents() {
   });
 }
 
+async function bindDesktopDragDrop() {
+  const currentWindow = getCurrentWindow();
+  await currentWindow.onDragDropEvent(async (event) => {
+    if (event.payload.type === "enter" || event.payload.type === "over") {
+      updateDropZoneDragState(true);
+      setPickerStatus("放開滑鼠即可加入音訊檔");
+      return;
+    }
+
+    if (event.payload.type === "leave") {
+      updateDropZoneDragState(false);
+      if (!state.items.length) {
+        setPickerStatus("請直接從 Finder 拖放音訊檔到這裡");
+      }
+      return;
+    }
+
+    if (event.payload.type === "drop") {
+      updateDropZoneDragState(false);
+      try {
+        const audioPaths = (event.payload.paths || []).filter((path) =>
+          /\.(mp3|wav|m4a|flac|ogg|aac|wma)$/i.test(path),
+        );
+        if (!audioPaths.length) {
+          setPickerStatus("拖入的檔案不是支援的音訊格式", "error");
+          return;
+        }
+        await enqueuePaths(audioPaths, "拖放音訊檔");
+      } catch (error) {
+        console.error(error);
+        setPickerStatus(`拖放失敗: ${error?.message || error}`, "error");
+        setActionStatus(`加入音訊檔案失敗: ${error?.message || error}`, "error");
+      }
+    }
+  });
+}
+
 async function init() {
   cacheElements();
+  setPickerStatus("請直接從 Finder 拖放音訊檔到這裡");
   bindEvents();
   bindScrollMotion();
   await bindBackendEvents();
+  await bindDesktopDragDrop();
   const savedToken = localStorage.getItem("hf_token") || "";
   if (savedToken) els["hf-token"].value = savedToken;
   setDiarizeOptionsVisible(els["diarize-toggle"].checked);

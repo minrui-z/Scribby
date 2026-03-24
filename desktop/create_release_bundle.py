@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import subprocess
 from pathlib import Path
 
 
@@ -11,6 +12,7 @@ RELEASE_DIR = PROJECT_ROOT / "release"
 APP_TARGET = RELEASE_DIR / "逐字搞定 Beta.app"
 README_TARGET = RELEASE_DIR / "README.txt"
 RUNTIME_SOURCE = PROJECT_ROOT / "desktop" / "runtime"
+SMOKE_SCRIPT = PROJECT_ROOT / "desktop" / "smoke_test_desktop_bundle.py"
 
 
 README_TEXT = """逐字搞定 Beta
@@ -43,6 +45,26 @@ def copy_runtime_into_app(app_root: Path) -> None:
         shutil.copytree(source, target)
 
 
+def size_mb(path: Path) -> float:
+    total = 0
+    if path.is_file():
+        return path.stat().st_size / (1024 * 1024)
+    for item in path.rglob("*"):
+        if item.is_file():
+            total += item.stat().st_size
+    return total / (1024 * 1024)
+
+
+def reset_directory(path: Path) -> None:
+    if not path.exists():
+        return
+    for child in path.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clean", action="store_true")
@@ -52,7 +74,7 @@ def main() -> int:
         raise SystemExit(f"找不到已打包的 App：{APP_SOURCE}")
 
     if args.clean and RELEASE_DIR.exists():
-        shutil.rmtree(RELEASE_DIR)
+        reset_directory(RELEASE_DIR)
 
     RELEASE_DIR.mkdir(parents=True, exist_ok=True)
     if APP_TARGET.exists():
@@ -60,7 +82,14 @@ def main() -> int:
 
     shutil.copytree(APP_SOURCE, APP_TARGET)
     copy_runtime_into_app(APP_TARGET)
+    subprocess.run(
+        ["venv/bin/python", str(SMOKE_SCRIPT), "--app", str(APP_TARGET)],
+        cwd=PROJECT_ROOT,
+        check=True,
+    )
     README_TARGET.write_text(README_TEXT, encoding="utf-8")
+    print(f"App size: {size_mb(APP_TARGET):.1f} MB")
+    print(f"Runtime size: {size_mb(RUNTIME_SOURCE):.1f} MB")
     print(f"Prepared release folder at: {RELEASE_DIR}")
     return 0
 

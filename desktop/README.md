@@ -1,11 +1,12 @@
-# Scribby Desktop Workspace
+# 逐字搞定 Desktop Workspace
 
-這個資料夾是 Scribby 的桌面版工作區。
+這個資料夾是桌面版工作區，不取代現有 Web 測試版。
 目前只支援 `macOS Apple Silicon`。
 
 ## 目標
 
 - 使用 `Tauri` 建立真正桌面視窗
+- 保留現有 `app.py` / `templates/index.html` 作為 Web 測試版
 - 共用 `engine.py` 與 `transcribe_worker.py` 的轉譯核心
 - 桌面版打包流程只針對 `.app` 產物優化
 

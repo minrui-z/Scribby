@@ -95,7 +95,7 @@ def main() -> int:
         capture_output=True,
         env=env,
         cwd=root / "desktop",
-        timeout=30,
+        timeout=120,
     )
 
     if proc.returncode != 0:
@@ -125,6 +125,30 @@ def main() -> int:
         raise SystemExit(
             "Desktop bundle smoke test 失敗：未收到完整 backend_ready/get_info 回應\n"
             + (proc.stdout or "")
+        )
+
+    import_check = subprocess.run(
+        [
+            str(python_bin),
+            "-c",
+            (
+                "import mlx_whisper;"
+                "from whisperx.diarize import DiarizationPipeline;"
+                "import whisperx.audio;"
+                "print('desktop-runtime-imports-ok')"
+            ),
+        ],
+        text=True,
+        capture_output=True,
+        env=env,
+        cwd=root / "desktop",
+        timeout=120,
+    )
+    if import_check.returncode != 0 or "desktop-runtime-imports-ok" not in (import_check.stdout or ""):
+        raise SystemExit(
+            "Desktop bundle smoke test 失敗：runtime import 檢查未通過\n"
+            f"stdout={import_check.stdout.strip()}\n"
+            f"stderr={import_check.stderr.strip()}"
         )
 
     print(f"Desktop bundle smoke test passed: {app_path}")

@@ -1,0 +1,9 @@
+rfd 0.15.2
+ashpd 0.10.3
+dispatch 0.2.0
+dispatch2 0.3.0
+objc-sys 0.3.5
+objc2 0.5.2
+objc2-app-kit 0.2.2
+tauri 2.10.3
+wry 0.54.4

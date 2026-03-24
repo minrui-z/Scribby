@@ -16,6 +16,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{ChildStdin, Command},
     sync::{oneshot, Mutex},
+    time::{timeout, Duration},
 };
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -316,12 +317,77 @@ async fn backend_command(
     backend_call(&state, &command, args).await
 }
 
+fn escape_applescript_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+async fn run_osascript(lines: &[String]) -> Result<Option<String>, String> {
+    let mut command = Command::new("/usr/bin/osascript");
+    for line in lines {
+        command.arg("-e").arg(line);
+    }
+
+    let output = timeout(Duration::from_secs(45), command.output())
+        .await
+        .map_err(|_| "選檔視窗逾時，可能被系統擋在其他桌面或沒有成功彈出".to_string())?
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(stdout))
+        }
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let combined = if stderr.is_empty() {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        } else {
+            stderr
+        };
+        if combined.contains("User canceled") || combined.contains("(-128)") {
+            Ok(None)
+        } else {
+            Err(if combined.is_empty() {
+                "macOS 選擇視窗執行失敗".to_string()
+            } else {
+                combined
+            })
+        }
+    }
+}
+
 #[tauri::command]
-async fn pick_audio_files() -> Result<Vec<String>, String> {
+async fn pick_audio_files_b() -> Result<Vec<String>, String> {
+    let script = vec![
+        r#"tell application id "com.minrui.zhuzigaoding" to activate"#.to_string(),
+        r#"delay 0.1"#.to_string(),
+        r#"set chosenFiles to choose file with prompt "選取音訊檔" with multiple selections allowed"#.to_string(),
+        r#"set outputLines to {}"#.to_string(),
+        r#"repeat with aFile in chosenFiles"#.to_string(),
+        r#"set end of outputLines to POSIX path of aFile"#.to_string(),
+        r#"end repeat"#.to_string(),
+        r#"set AppleScript's text item delimiters to linefeed"#.to_string(),
+        r#"return outputLines as text"#.to_string(),
+    ];
+
+    let stdout = run_osascript(&script).await?;
+    Ok(stdout
+        .map(|text| {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+async fn pick_audio_files_a() -> Result<Vec<String>, String> {
     let files = FileDialog::new()
         .add_filter("audio", &["mp3", "wav", "m4a", "flac", "ogg", "aac", "wma"])
         .pick_files();
-
     Ok(files
         .unwrap_or_default()
         .into_iter()
@@ -330,54 +396,34 @@ async fn pick_audio_files() -> Result<Vec<String>, String> {
 }
 
 #[tauri::command]
-async fn save_result(
-    file_id: String,
-    suggested_filename: String,
-    state: State<'_, BackendState>,
-) -> Result<bool, String> {
-    let destination = FileDialog::new()
-        .set_file_name(&suggested_filename)
-        .save_file();
-
-    let Some(path) = destination else {
-        return Ok(false);
-    };
-
-    backend_call(
-        &state,
-        "save_result",
-        json!({
-            "file_id": file_id,
-            "destination_path": path.display().to_string(),
-        }),
-    )
-    .await?;
-    Ok(true)
+async fn pick_audio_files() -> Result<Vec<String>, String> {
+    pick_audio_files_b().await
 }
 
 #[tauri::command]
-async fn save_all_results(
-    file_ids: Vec<String>,
-    state: State<'_, BackendState>,
-) -> Result<bool, String> {
-    let destination = FileDialog::new()
-        .set_file_name("transcripts.zip")
-        .save_file();
+async fn pick_save_result_path(suggested_filename: String) -> Result<Option<String>, String> {
+    let escaped_name = escape_applescript_string(&suggested_filename);
+    let script = vec![
+        r#"tell application id "com.minrui.zhuzigaoding" to activate"#.to_string(),
+        r#"delay 0.1"#.to_string(),
+        format!(
+            r#"set targetFile to choose file name with prompt "儲存逐字稿" default name "{}""#,
+            escaped_name
+        ),
+        r#"return POSIX path of targetFile"#.to_string(),
+    ];
+    run_osascript(&script).await
+}
 
-    let Some(path) = destination else {
-        return Ok(false);
-    };
-
-    backend_call(
-        &state,
-        "save_all_results",
-        json!({
-            "file_ids": file_ids,
-            "destination_path": path.display().to_string(),
-        }),
-    )
-    .await?;
-    Ok(true)
+#[tauri::command]
+async fn pick_save_all_results_path() -> Result<Option<String>, String> {
+    let script = vec![
+        r#"tell application id "com.minrui.zhuzigaoding" to activate"#.to_string(),
+        r#"delay 0.1"#.to_string(),
+        r#"set targetFile to choose file name with prompt "儲存全部結果" default name "transcripts.zip""#.to_string(),
+        r#"return POSIX path of targetFile"#.to_string(),
+    ];
+    run_osascript(&script).await
 }
 
 fn ensure_path(path: &Path) -> Result<(), String> {
@@ -400,9 +446,11 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             backend_command,
+            pick_audio_files_a,
+            pick_audio_files_b,
             pick_audio_files,
-            save_result,
-            save_all_results
+            pick_save_result_path,
+            pick_save_all_results_path
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
