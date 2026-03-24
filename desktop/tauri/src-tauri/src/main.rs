@@ -360,7 +360,7 @@ async fn run_osascript(lines: &[String]) -> Result<Option<String>, String> {
 #[tauri::command]
 async fn pick_audio_files_b() -> Result<Vec<String>, String> {
     let script = vec![
-        r#"tell application id "com.minrui.zhuzigaoding" to activate"#.to_string(),
+        r#"tell application id "com.minrui.scribby" to activate"#.to_string(),
         r#"delay 0.1"#.to_string(),
         r#"set chosenFiles to choose file with prompt "選取音訊檔" with multiple selections allowed"#.to_string(),
         r#"set outputLines to {}"#.to_string(),
@@ -404,7 +404,7 @@ async fn pick_audio_files() -> Result<Vec<String>, String> {
 async fn pick_save_result_path(suggested_filename: String) -> Result<Option<String>, String> {
     let escaped_name = escape_applescript_string(&suggested_filename);
     let script = vec![
-        r#"tell application id "com.minrui.zhuzigaoding" to activate"#.to_string(),
+        r#"tell application id "com.minrui.scribby" to activate"#.to_string(),
         r#"delay 0.1"#.to_string(),
         format!(
             r#"set targetFile to choose file name with prompt "儲存逐字稿" default name "{}""#,
@@ -418,7 +418,7 @@ async fn pick_save_result_path(suggested_filename: String) -> Result<Option<Stri
 #[tauri::command]
 async fn pick_save_all_results_path() -> Result<Option<String>, String> {
     let script = vec![
-        r#"tell application id "com.minrui.zhuzigaoding" to activate"#.to_string(),
+        r#"tell application id "com.minrui.scribby" to activate"#.to_string(),
         r#"delay 0.1"#.to_string(),
         r#"set targetFile to choose file name with prompt "儲存全部結果" default name "transcripts.zip""#.to_string(),
         r#"return POSIX path of targetFile"#.to_string(),

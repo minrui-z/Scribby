@@ -92,4 +92,4 @@
   `NSOpenPanel` 在這個桌面版環境裡不穩，不要再改回 `rfd` 或 `tauri-plugin-dialog` 的原生檔案對話框。
 
 - 選檔卡在「正在開啟選檔視窗」
-  不要用 `System Events` 來切前景；桌面版只允許用 `tell application id "com.minrui.zhuzigaoding" to activate` 後再跑 `choose file / choose file name`。
+  不要用 `System Events` 來切前景；桌面版只允許用 `tell application id "com.minrui.scribby" to activate` 後再跑 `choose file / choose file name`。
