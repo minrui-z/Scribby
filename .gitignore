@@ -5,10 +5,16 @@ __pycache__/
 
 venv/
 .env
-
-desktop/runtime/
-desktop/tauri/node_modules/
-desktop/tauri/src-tauri/target/
+desktop-appkit/.venv/
+desktop-appkit/.build/
+desktop-appkit/build/
+desktop-appkit/probe/
+desktop-appkit/python/__pycache__/
+desktop-appkit/swiftwhisper-core/.build/
+desktop-appkit/swiftwhisper-core/.models/
+desktop-appkit/vendor/SwiftWhisper/.git/
+desktop-appkit/vendor/SwiftWhisper/whisper.cpp/.git/
+desktop-appkit/vendor/SwiftWhisper/whisper.cpp/models/
 
 release/
 dist/

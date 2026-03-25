@@ -1,92 +1,46 @@
-# Scribby / 逐字搞定
+# Scribby v0.2.0-beta
 
-[![Download Beta](https://img.shields.io/badge/Download-Beta-1f1a17?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/minrui-z/Scribby/releases/tag/v0.1.0-beta.1)
+Scribby 現在以 **macOS 原生 SwiftUI/AppKit 版本** 作為主線。
 
-**Scribby** is a desktop transcription project for `macOS Apple Silicon`.  
-**逐字搞定** 是一個專為 `macOS Apple Silicon` 設計的桌面語音轉譯專案。
+這一版的核心方向：
+- `SwiftWhisper + Core ML` 做逐字稿轉寫
+- `pyannote` 做真正的多語者 diarization
+- Native UI/UX 取代舊的 Tauri 桌面版
 
-## Release
+## Repo 結構
 
-- Latest beta release: [`v0.1.0-beta.1`](https://github.com/minrui-z/Scribby/releases/tag/v0.1.0-beta.1)
-- Download asset: [`Scribby-Beta-0.1.0-beta.1-macos-arm64.zip`](https://github.com/minrui-z/Scribby/releases/download/v0.1.0-beta.1/Scribby-Beta-0.1.0-beta.1-macos-arm64.zip)
-- GitHub Releases: <https://github.com/minrui-z/Scribby/releases>
-- Recommended distribution format: packaged `.app` delivered via the release zip
-- Release line: `beta`
+- `desktop-appkit/`
+  原生 macOS app 主線
+- `desktop-appkit/Sources/`
+  App、Bridge、UI、Support
+- `desktop-appkit/swiftwhisper-core/`
+  headless SwiftWhisper 核心
+- `desktop-appkit/vendor/SwiftWhisper/`
+  本地 fork 的 SwiftWhisper / whisper.cpp 相容層
+- `desktop-appkit/python/pyannote_diarize.py`
+  多語者辨識 helper
 
-- 最新 beta 版本：[`v0.1.0-beta.1`](https://github.com/minrui-z/Scribby/releases/tag/v0.1.0-beta.1)
-- 下載檔案：[`Scribby-Beta-0.1.0-beta.1-macos-arm64.zip`](https://github.com/minrui-z/Scribby/releases/download/v0.1.0-beta.1/Scribby-Beta-0.1.0-beta.1-macos-arm64.zip)
-- GitHub 發佈頁：<https://github.com/minrui-z/Scribby/releases>
-- 建議提供給使用者的格式：透過 release zip 發佈的已打包 `.app`
-- 目前版本線：`beta`
+## 目前狀態
 
-## Status / 目前狀態
+- 預設模型：`large-v3-turbo`
+- 結果輸出：分時間分段稿
+- 語者辨識：需 Hugging Face token
+- 檔案加入：支援拖放與原生檔案選取
 
-- Platform / 平台: `macOS Apple Silicon only`
-- Shell / 桌面殼: `Tauri 2`
-- Backend / 後端: `Python`
-- Transcription engine / 轉譯核心: `MLX Whisper`
-- App phase / 階段: `beta`
-
-## Features / 功能
-
-- Batch audio import and queue management
-- Live progress updates with floating transcript lines
-- Optional speaker diarization
-- Single `.txt` export and zip export for all completed results
-- Native desktop window without requiring users to open a browser
-
-- 本機音訊檔案批次加入與序列管理
-- 即時轉譯進度與逐行漂浮字幕
-- 可選語者分離
-- 單檔 `.txt` 匯出與全部結果壓縮下載
-- 原生桌面視窗執行，不需手動開瀏覽器
-
-
-## Requirements / 開發需求
-
-- macOS 13+
-- Apple Silicon Mac
-- Python 3.10+
-- Node.js
-- Rust / Cargo
-- `ffmpeg`
-
-## Quick Start / 快速開始
+## 開發
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-cd desktop/tauri
-npm install
-npm run dev
+cd desktop-appkit
+./build.sh
 ```
 
+編譯完成後，app 會在：
 
-## Design Direction / 設計方向
+```bash
+desktop-appkit/build/逐字搞定 Beta.app
+```
 
-- Light UI with strong readability
-- macOS-inspired glass surface treatment
-- Subtle motion instead of flashy UI
-- Focus on transcription progress and minimal distraction during processing
+## 備註
 
-- 淺色介面與高可讀性
-- 接近 macOS 的玻璃材質感
-- 保留細微動態效果，不追求花俏 UI
-- 轉譯中以內容與進度為主，減少干擾
-
-## Limitations / 限制
-
-- Not supported on Windows, Linux, or Intel Mac
-- `MLX` mode cannot safely hard-stop the current task
-- First-time model initialization can take longer
-
-- 目前不支援 Windows、Linux 或 Intel Mac
-- `MLX` 模式下無法安全硬停止目前任務
-- 首次模型初始化可能需要較長時間
-
-## Workspace Notes / 工作區說明
-
-See [desktop/README.md](desktop/README.md) for desktop workspace details.  
-桌面版工作區的詳細說明請見 [desktop/README.md](desktop/README.md)。
+- 這個 repo 已不再以舊 `desktop/` Tauri 版本作為主線。
+- 大型模型與 Core ML 資產不直接放進 Git；開發與執行時會優先使用本機快取與必要的下載流程。
