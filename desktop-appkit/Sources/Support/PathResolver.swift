@@ -290,6 +290,15 @@ enum PathResolver {
                 env["PYTHONHOME"] = pythonHome.path
                 env["PYTHONPATH"] = pythonHome.appendingPathComponent("lib/python3.10/site-packages").path
                 env["PYTHONNOUSERSITE"] = "1"
+            } else {
+                // Clear any inherited Python env vars that could break the managed venv
+                // (e.g. from Anaconda, Miniconda, pyenv, or other Python managers)
+                env.removeValue(forKey: "PYTHONHOME")
+                env.removeValue(forKey: "PYTHONPATH")
+                env.removeValue(forKey: "VIRTUAL_ENV")
+                env.removeValue(forKey: "CONDA_PREFIX")
+                env.removeValue(forKey: "CONDA_DEFAULT_ENV")
+                env["PYTHONNOUSERSITE"] = "1"
             }
         }
 

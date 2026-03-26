@@ -218,7 +218,21 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     onEvent?(.taskProgress(fileId: item.fileId, message: "正在使用 SwiftWhisper 轉寫...", progress: 15))
                     onEvent?(.queueUpdated(snapshot))
                 } else {
-                    audioPath = item.id
+                    // Try to pre-convert to 16kHz PCM WAV so the headless binary
+                    // can parse it directly without AVFoundation or ffmpeg.
+                    // If conversion fails, pass the original file — headless will
+                    // try its own AVFoundation + direct WAV + ffmpeg fallback chain.
+                    let wavURL = FileManager.default.temporaryDirectory
+                        .appendingPathComponent(UUID().uuidString)
+                        .appendingPathExtension("wav")
+                    do {
+                        try await Self.convertToWAV(inputPath: item.id, outputPath: wavURL.path)
+                        enhancedTempURL = wavURL  // reuse for cleanup
+                        audioPath = wavURL.path
+                    } catch {
+                        try? FileManager.default.removeItem(at: wavURL)
+                        audioPath = item.id
+                    }
                 }
 
                 let result = try await Self.runHeadless(
@@ -862,94 +876,19 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         }.value
     }
 
-    /// Convert any audio file to 16-bit PCM WAV using AVFoundation (no ffmpeg needed).
+    /// Convert any audio file to 16kHz mono 16-bit PCM WAV using AVFoundation (no ffmpeg needed).
     private static func convertToWAV(inputPath: String, outputPath: String) async throws {
+        let inputURL = URL(fileURLWithPath: inputPath)
+        let outputURL = URL(fileURLWithPath: outputPath)
+        try? FileManager.default.removeItem(at: outputURL)
+
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            let inputURL = URL(fileURLWithPath: inputPath)
-            let outputURL = URL(fileURLWithPath: outputPath)
-
-            // Remove existing output if any
-            try? FileManager.default.removeItem(at: outputURL)
-
-            guard let asset = try? AVAudioFile(forReading: inputURL) else {
-                // Fallback: use AVAsset for non-WAV formats
-                let avAsset = AVURLAsset(url: inputURL)
-                guard let exportSession = AVAssetExportSession(asset: avAsset, presetName: AVAssetExportPresetPassthrough) else {
-                    continuation.resume(throwing: NSError(
-                        domain: "SwiftWhisperProvider", code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "無法建立音訊轉換 session"]
-                    ))
-                    return
+            Self.convertWithAVAsset(inputURL: inputURL, outputURL: outputURL) { error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else {
+                    continuation.resume()
                 }
-                // Use AVAssetReader/Writer for proper PCM conversion
-                Self.convertWithAVAsset(inputURL: inputURL, outputURL: outputURL) { error in
-                    if let error {
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume()
-                    }
-                }
-                return
-            }
-
-            // Input is already readable by AVAudioFile — convert to 16-bit PCM WAV
-            let format = asset.processingFormat
-            guard let outputFormat = AVAudioFormat(
-                commonFormat: .pcmFormatInt16,
-                sampleRate: format.sampleRate,
-                channels: 1,
-                interleaved: true
-            ) else {
-                continuation.resume(throwing: NSError(
-                    domain: "SwiftWhisperProvider", code: 1,
-                    userInfo: [NSLocalizedDescriptionKey: "無法建立輸出音訊格式"]
-                ))
-                return
-            }
-
-            do {
-                let outputFile = try AVAudioFile(
-                    forWriting: outputURL,
-                    settings: outputFormat.settings,
-                    commonFormat: .pcmFormatInt16,
-                    interleaved: true
-                )
-
-                guard let converter = AVAudioConverter(from: format, to: outputFormat) else {
-                    continuation.resume(throwing: NSError(
-                        domain: "SwiftWhisperProvider", code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "無法建立音訊轉換器"]
-                    ))
-                    return
-                }
-
-                let bufferSize: AVAudioFrameCount = 8192
-                guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: bufferSize),
-                      let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: bufferSize) else {
-                    continuation.resume(throwing: NSError(
-                        domain: "SwiftWhisperProvider", code: 1,
-                        userInfo: [NSLocalizedDescriptionKey: "無法建立音訊緩衝區"]
-                    ))
-                    return
-                }
-
-                while asset.framePosition < asset.length {
-                    let framesToRead = min(bufferSize, AVAudioFrameCount(asset.length - asset.framePosition))
-                    try asset.read(into: inputBuffer, frameCount: framesToRead)
-
-                    var error: NSError?
-                    converter.convert(to: outputBuffer, error: &error) { _, outStatus in
-                        outStatus.pointee = .haveData
-                        return inputBuffer
-                    }
-                    if let error { throw error }
-
-                    try outputFile.write(from: outputBuffer)
-                }
-
-                continuation.resume()
-            } catch {
-                continuation.resume(throwing: error)
             }
         }
     }
@@ -991,11 +930,37 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         writer.add(writerInput)
 
         reader.startReading()
+
+        // Check if reader actually started
+        guard reader.status == .reading else {
+            let desc = reader.error?.localizedDescription ?? "未知錯誤"
+            completion(NSError(domain: "SwiftWhisperProvider", code: 1,
+                               userInfo: [NSLocalizedDescriptionKey: "無法讀取音訊：\(desc)"]))
+            return
+        }
+
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
 
         writerInput.requestMediaDataWhenReady(on: DispatchQueue(label: "wav-convert")) {
             while writerInput.isReadyForMoreMediaData {
+                // Check reader status before calling copyNextSampleBuffer
+                // to avoid ObjC exception crash when reader is in failed/cancelled state
+                guard reader.status == .reading else {
+                    writerInput.markAsFinished()
+                    if reader.status == .failed {
+                        writer.cancelWriting()
+                        let desc = reader.error?.localizedDescription ?? "音訊讀取失敗"
+                        completion(NSError(domain: "SwiftWhisperProvider", code: 1,
+                                           userInfo: [NSLocalizedDescriptionKey: desc]))
+                    } else {
+                        writer.finishWriting {
+                            completion(writer.error)
+                        }
+                    }
+                    return
+                }
+
                 if let buffer = readerOutput.copyNextSampleBuffer() {
                     writerInput.append(buffer)
                 } else {

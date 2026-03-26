@@ -102,12 +102,32 @@ actor PythonEnvironmentManager {
 
     // MARK: - Private
 
+    /// Build a clean environment for running Python subprocesses,
+    /// stripping vars that could interfere with the managed venv
+    /// (e.g. Anaconda, Miniconda, pyenv).
+    private func cleanEnvironment(python: URL? = nil) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "PYTHONHOME")
+        env.removeValue(forKey: "PYTHONPATH")
+        env.removeValue(forKey: "VIRTUAL_ENV")
+        env.removeValue(forKey: "CONDA_PREFIX")
+        env.removeValue(forKey: "CONDA_DEFAULT_ENV")
+        env["PYTHONNOUSERSITE"] = "1"
+        if let python = python {
+            let binDir = python.deletingLastPathComponent().path
+            let existing = env["PATH"] ?? "/usr/bin:/bin"
+            env["PATH"] = binDir + ":" + existing
+        }
+        return env
+    }
+
     private func createVenv(at directory: URL, log: @escaping @Sendable (String) -> Void) async throws {
         let basePython = try await findSystemPython(log: log)
 
         let process = Process()
         process.executableURL = basePython
         process.arguments = ["-m", "venv", directory.path]
+        process.environment = cleanEnvironment()
 
         let stderr = Pipe()
         process.standardError = stderr
@@ -121,9 +141,11 @@ actor PythonEnvironmentManager {
         }
 
         log("正在升級 pip...")
+        let venvPy = directory.appendingPathComponent("bin/python3")
         let pip = Process()
-        pip.executableURL = directory.appendingPathComponent("bin/python3")
+        pip.executableURL = venvPy
         pip.arguments = ["-m", "pip", "install", "--upgrade", "pip"]
+        pip.environment = cleanEnvironment(python: venvPy)
         pip.standardOutput = FileHandle.nullDevice
         pip.standardError = FileHandle.nullDevice
         try pip.run()
@@ -226,6 +248,7 @@ actor PythonEnvironmentManager {
         let process = Process()
         process.executableURL = python
         process.arguments = ["-c", "import \(module)"]
+        process.environment = cleanEnvironment(python: python)
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
 
@@ -247,6 +270,7 @@ actor PythonEnvironmentManager {
         let process = Process()
         process.executableURL = python
         process.arguments = ["-m", "pip", "install", "--progress-bar=on"] + packages
+        process.environment = cleanEnvironment(python: python)
 
         let stderr = Pipe()
         let stdout = Pipe()
@@ -255,12 +279,14 @@ actor PythonEnvironmentManager {
 
         // Track current downloading package
         let state = PipParserState()
+        let collectedStderr = StderrCollector()
 
         let stderrHandle = stderr.fileHandleForReading
         stderrHandle.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
             let text = String(decoding: data, as: UTF8.self)
+            collectedStderr.append(text)
             for line in text.split(whereSeparator: \.isNewline) {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
@@ -296,7 +322,7 @@ actor PythonEnvironmentManager {
         stdoutHandle.readabilityHandler = nil
 
         guard process.terminationStatus == 0 else {
-            let errText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            let errText = collectedStderr.text.trimmingCharacters(in: .whitespacesAndNewlines)
             throw ResolverError.missingPath("pip install 失敗：\(errText)")
         }
     }
@@ -408,4 +434,22 @@ actor PythonEnvironmentManager {
 private final class PipParserState: @unchecked Sendable {
     var currentPackage: String?
     var currentTotalBytes: Int64 = 0
+}
+
+/// Thread-safe collector for stderr output.
+private final class StderrCollector: @unchecked Sendable {
+    private var buffer = ""
+    private let lock = NSLock()
+
+    func append(_ text: String) {
+        lock.lock()
+        buffer += text
+        lock.unlock()
+    }
+
+    var text: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer
+    }
 }
