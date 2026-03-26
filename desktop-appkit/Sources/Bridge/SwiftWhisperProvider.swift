@@ -565,13 +565,14 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 }
             }
 
-            let stderrCollector = StreamCollector()
+            let collectedStderr = StderrCollector()
             let stderrHandle = stderr.fileHandleForReading
             stderrHandle.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
-                let lines = stderrCollector.append(data)
-                for line in lines {
+                let text = String(decoding: data, as: UTF8.self)
+                collectedStderr.append(text)
+                for line in text.split(whereSeparator: \.isNewline) {
                     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { continue }
                     if let dl = Self.parseDownloadLine(trimmed) {
@@ -612,12 +613,10 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     }
                 }
             }
-            let remainingStderr = stderr.fileHandleForReading.readDataToEndOfFile()
-            let stderrText = String(data: remainingStderr, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
             guard process.terminationStatus == 0 else {
-                let message = stderrText.isEmpty ? "SwiftWhisper 轉譯失敗" : stderrText
+                let errText = collectedStderr.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                let message = errText.isEmpty ? "SwiftWhisper 轉譯失敗" : errText
                 throw NSError(
                     domain: "SwiftWhisperProvider",
                     code: Int(process.terminationStatus),
