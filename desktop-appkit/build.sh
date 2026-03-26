@@ -23,6 +23,9 @@ SWIFT_SOURCES=(
   "$WORKSPACE"/Sources/Support/*.swift
 )
 
+MACOSX_DEPLOYMENT_TARGET=13.0
+export MACOSX_DEPLOYMENT_TARGET
+
 CPLUS_INCLUDE_PATH="$SDK_CXX_HEADERS" \
 /usr/bin/xcrun swift build \
   -c release \
@@ -41,8 +44,10 @@ HEADLESS_BIN="$(
 /usr/bin/xcrun swiftc \
   -O \
   -parse-as-library \
+  -target arm64-apple-macosx13.0 \
   -module-cache-path "$WORKSPACE/.build/swift-module-cache" \
   -framework AppKit \
+  -framework AVFoundation \
   -framework Foundation \
   -framework UniformTypeIdentifiers \
   "${SWIFT_SOURCES[@]}" \
