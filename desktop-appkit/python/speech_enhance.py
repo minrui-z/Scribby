@@ -74,15 +74,21 @@ def _load_model(model_name: str, precision: str = DEFAULT_PRECISION):
     """Load MossFormer2 SE model, working around missing config.json in the HF repo."""
     from pathlib import Path
 
-    import mlx.core as mx
-    import mlx.nn as nn
-    from mlx.utils import tree_unflatten
+    try:
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx.utils import tree_unflatten
+    except ImportError as exc:
+        _error(f"無法載入 MLX：{exc}\n請確認已安裝 mlx 套件")
 
-    from mlx_audio.sts.models.mossformer2_se.model import (
-        MossFormer2SE,
-        MossFormer2SEConfig,
-        MossFormer2SEModel,
-    )
+    try:
+        from mlx_audio.sts.models.mossformer2_se.model import (
+            MossFormer2SE,
+            MossFormer2SEConfig,
+            MossFormer2SEModel,
+        )
+    except ImportError as exc:
+        _error(f"無法載入 mlx-audio：{exc}\n請確認已安裝 mlx-audio 套件")
 
     config = MossFormer2SEConfig()
 

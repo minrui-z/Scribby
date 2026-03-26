@@ -7,7 +7,7 @@ enum PythonDependencyGroup: String, CaseIterable {
     var packages: [String] {
         switch self {
         case .enhancement:
-            return ["mlx", "mlx-audio", "huggingface_hub"]
+            return ["mlx", "mlx-audio", "soundfile", "huggingface_hub"]
         case .diarization:
             return ["torch", "pyannote.audio", "pandas", "huggingface_hub"]
         }
@@ -64,6 +64,12 @@ actor PythonEnvironmentManager {
         pipProgress: @escaping @Sendable (PipDownloadInfo) -> Void = { _ in }
     ) async throws {
         if readyGroups.contains(group) { return }
+
+        #if !arch(arm64)
+        if group == .enhancement {
+            throw ResolverError.missingPath("人聲加強功能需要 Apple Silicon（M1 以上）")
+        }
+        #endif
 
         let venvDir = try venvDirectory
         let python = try venvPython

@@ -768,6 +768,15 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         log: @escaping @Sendable (String) -> Void,
         downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void = { _, _, _ in }
     ) async throws {
+        // MLX only works on Apple Silicon
+        #if !arch(arm64)
+        throw NSError(
+            domain: "SwiftWhisperProvider",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "人聲加強功能需要 Apple Silicon（M1 以上）"]
+        )
+        #endif
+
         try await Task.detached(priority: .userInitiated) {
             let python = try PathResolver.pythonExecutable()
             let helper = try PathResolver.enhancementHelperScript()
@@ -782,11 +791,13 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             process.standardOutput = stdout
             process.standardError = stderr
 
+            let collectedStderr = StderrCollector()
             let stderrHandle = stderr.fileHandleForReading
             stderrHandle.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty else { return }
                 let text = String(decoding: data, as: UTF8.self)
+                collectedStderr.append(text)
                 for line in text.split(whereSeparator: \.isNewline) {
                     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !trimmed.isEmpty else { continue }
@@ -803,12 +814,11 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             stderrHandle.readabilityHandler = nil
 
             guard process.terminationStatus == 0 else {
-                let stderrText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let errText = collectedStderr.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 throw NSError(
                     domain: "SwiftWhisperProvider",
                     code: Int(process.terminationStatus),
-                    userInfo: [NSLocalizedDescriptionKey: stderrText.isEmpty ? "人聲加強失敗（exit code \(process.terminationStatus)）" : stderrText]
+                    userInfo: [NSLocalizedDescriptionKey: errText.isEmpty ? "人聲加強失敗（exit code \(process.terminationStatus)）" : errText]
                 )
             }
         }.value
@@ -1054,11 +1064,13 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 process.standardOutput = stdout
                 process.standardError = stderr
 
+                let collectedStderr = StderrCollector()
                 let stderrHandle = stderr.fileHandleForReading
                 stderrHandle.readabilityHandler = { handle in
                     let data = handle.availableData
                     guard !data.isEmpty else { return }
                     let text = String(decoding: data, as: UTF8.self)
+                    collectedStderr.append(text)
                     for line in text.split(whereSeparator: \.isNewline) {
                         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                         if !trimmed.isEmpty {
@@ -1072,14 +1084,13 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 stderrHandle.readabilityHandler = nil
 
                 let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
-                let stderrText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
                 guard process.terminationStatus == 0 else {
+                    let errText = collectedStderr.text.trimmingCharacters(in: .whitespacesAndNewlines)
                     throw NSError(
                         domain: "SwiftWhisperProvider",
                         code: Int(process.terminationStatus),
-                        userInfo: [NSLocalizedDescriptionKey: stderrText.isEmpty ? "pyannote diarization 失敗" : stderrText]
+                        userInfo: [NSLocalizedDescriptionKey: errText.isEmpty ? "pyannote diarization 失敗" : errText]
                     )
                 }
 
@@ -1089,6 +1100,24 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 throw error
             }
         }.value
+    }
+}
+
+/// Thread-safe collector for stderr output so error messages survive readabilityHandler consumption.
+private final class StderrCollector: @unchecked Sendable {
+    private var buffer = ""
+    private let lock = NSLock()
+
+    func append(_ text: String) {
+        lock.lock()
+        buffer += text
+        lock.unlock()
+    }
+
+    var text: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer
     }
 }
 
