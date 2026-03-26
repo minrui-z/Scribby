@@ -50,27 +50,14 @@ HEADLESS_BIN="$(
 rm -rf "$APP_DIR"
 mkdir -p "$BIN_DIR" "$RES_DIR/bin"
 mkdir -p "$RES_DIR/python"
-mkdir -p "$RES_DIR/swiftwhisper-models"
-
 cp "$BUILD_DIR/ScribbyNative" "$BIN_DIR/"
 cp "$HEADLESS_BIN" "$RES_DIR/bin/"
 cp "$WORKSPACE/python/pyannote_diarize.py" "$RES_DIR/python/"
+cp "$WORKSPACE/python/speech_enhance.py" "$RES_DIR/python/"
 cp "$WORKSPACE/Resources/Info.plist" "$APP_DIR/Contents/"
 
-for coreml_asset in \
-  "$WORKSPACE"/vendor/SwiftWhisper/whisper.cpp/models/ggml-*-encoder.mlpackage \
-  "$WORKSPACE"/vendor/SwiftWhisper/whisper.cpp/models/ggml-*-encoder.mlmodelc \
-  "$HOME"/Library/Application\ Support/com.minrui.scribby/swiftwhisper-models/ggml-*-encoder.mlpackage \
-  "$HOME"/Library/Application\ Support/com.minrui.scribby/swiftwhisper-models/ggml-*-encoder.mlmodelc \
-  "$HOME"/Library/Application\ Support/com.minrui.scribby.native/swiftwhisper-models/ggml-*-encoder.mlpackage \
-  "$HOME"/Library/Application\ Support/com.minrui.scribby.native/swiftwhisper-models/ggml-*-encoder.mlmodelc; do
-  if [ -e "$coreml_asset" ]; then
-    asset_name="$(basename "$coreml_asset")"
-    if [ ! -e "$RES_DIR/swiftwhisper-models/$asset_name" ]; then
-      cp -R "$coreml_asset" "$RES_DIR/swiftwhisper-models/"
-    fi
-  fi
-done
+# Models and CoreML encoders are downloaded/prepared at runtime on first launch.
+# App bundle ships without model assets to stay minimal.
 
 xattr -cr "$APP_DIR"
 codesign --force --sign - "$APP_DIR" || echo "codesign skipped: bundle contains metadata that still needs cleanup"

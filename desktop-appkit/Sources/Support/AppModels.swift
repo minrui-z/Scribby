@@ -23,6 +23,55 @@ struct TranscriptResult: Equatable {
     var segments: [TranscriptSegment]
 }
 
+enum ProcessingPhase: String, Equatable, CaseIterable {
+    case downloading
+    case enhancing
+    case transcribing
+    case diarizing
+
+    var color: Color {
+        switch self {
+        case .downloading: return Color(red: 0.23, green: 0.51, blue: 0.96)   // #3B82F6
+        case .enhancing:   return Color(red: 0.55, green: 0.36, blue: 0.96)   // #8B5CF6
+        case .transcribing: return Color(red: 0.96, green: 0.62, blue: 0.04)  // #F59E0B
+        case .diarizing:   return Color(red: 0.06, green: 0.73, blue: 0.51)   // #10B981
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .downloading:  return "下載模型"
+        case .enhancing:    return "人聲加強"
+        case .transcribing: return "轉寫"
+        case .diarizing:    return "語者辨識"
+        }
+    }
+}
+
+struct DownloadProgress: Equatable {
+    var filename: String
+    var bytesDownloaded: Int64
+    var totalBytes: Int64
+    var bytesPerSecond: Double
+
+    var fractionCompleted: Double {
+        totalBytes > 0 ? Double(bytesDownloaded) / Double(totalBytes) : 0
+    }
+    var formattedDownloaded: String {
+        ByteCountFormatter.string(fromByteCount: bytesDownloaded, countStyle: .file)
+    }
+    var formattedTotal: String {
+        ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+    }
+    var formattedSpeed: String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytesPerSecond), countStyle: .file) + "/s"
+    }
+    var estimatedSecondsRemaining: Double? {
+        guard bytesPerSecond > 0 else { return nil }
+        return Double(totalBytes - bytesDownloaded) / bytesPerSecond
+    }
+}
+
 struct QueueItemModel: Identifiable, Equatable {
     let id: String
     let fileId: String
@@ -33,6 +82,9 @@ struct QueueItemModel: Identifiable, Equatable {
     var message: String
     var error: String?
     var result: TranscriptResult?
+    var phase: ProcessingPhase?
+    var activePhases: [ProcessingPhase] = []
+    var downloadProgress: DownloadProgress?
 }
 
 struct FloatingLineModel: Identifiable, Equatable {
@@ -89,6 +141,7 @@ struct TranscriptionRequest: Equatable {
     var diarize: Bool
     var speakers: Int
     var token: String
+    var enhance: Bool
 }
 
 enum ProviderEvent: Equatable {
@@ -103,5 +156,7 @@ enum ProviderEvent: Equatable {
     case taskCompleted(fileId: String, filename: String, result: TranscriptResult)
     case taskFailed(fileId: String, message: String)
     case taskStopped(fileId: String, message: String)
+    case taskPhaseChanged(fileId: String, phase: ProcessingPhase, activePhases: [ProcessingPhase])
+    case taskDownloadProgress(fileId: String, info: DownloadProgress)
     case backendError(String)
 }

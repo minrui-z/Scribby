@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 @MainActor
@@ -39,6 +40,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     func subscribeEvents() async throws {}
 
     func verifyToken(_ token: String) async throws -> TokenVerificationResult {
+        try await PythonEnvironmentManager.shared.ensureReady(for: .diarization) { _ in }
         return try await Self.verifyHuggingFaceToken(token)
     }
 
@@ -123,19 +125,104 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     }
 
     private func processPending(request: TranscriptionRequest) async {
-        while let index = snapshot.items.firstIndex(where: { $0.status == "pending" || $0.status == "error" }) {
+        while let index = snapshot.items.firstIndex(where: { $0.status == "pending" }) {
             let item = snapshot.items[index]
-            let progressMessage = request.diarize
-                ? "正在使用 SwiftWhisper 轉寫，稍後交給 pyannote 做多語者辨識..."
-                : "正在使用 SwiftWhisper 轉寫..."
-            updateProcessingState(for: index, message: progressMessage)
+
+            // Determine active phases for this task
+            var activePhases: [ProcessingPhase] = []
+            if request.enhance { activePhases.append(.enhancing) }
+            activePhases.append(.transcribing)
+            if request.diarize { activePhases.append(.diarizing) }
+
+            let initialPhase: ProcessingPhase = request.enhance ? .enhancing : .transcribing
+            let progressMessage = initialPhase.label + "..."
+
+            updateProcessingState(for: index, message: progressMessage, phase: initialPhase, activePhases: activePhases)
             onEvent?(.taskStarted(fileId: item.fileId, filename: item.filename))
-            onEvent?(.taskProgress(fileId: item.fileId, message: progressMessage, progress: nil))
+            onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: initialPhase, activePhases: activePhases))
+            onEvent?(.taskProgress(fileId: item.fileId, message: progressMessage, progress: 5))
             onEvent?(.queueUpdated(snapshot))
 
+            var enhancedTempURL: URL?
             do {
+                // Ensure Python environment is ready for required features
+                if request.enhance {
+                    onEvent?(.taskProgress(fileId: item.fileId, message: "正在準備人聲加強環境...", progress: nil))
+                    try await PythonEnvironmentManager.shared.ensureReady(
+                        for: .enhancement,
+                        log: { _ in },
+                        pipProgress: { [weak self] info in
+                            Task { @MainActor in
+                                guard let self else { return }
+                                self.handlePipProgress(info, fileId: item.fileId, itemIndex: index, activePhases: activePhases)
+                            }
+                        }
+                    )
+                    snapshot.items[index].downloadProgress = nil
+                    snapshot.items[index].phase = initialPhase
+                    onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: initialPhase, activePhases: activePhases))
+                    onEvent?(.queueUpdated(snapshot))
+                }
+                if request.diarize {
+                    onEvent?(.taskProgress(fileId: item.fileId, message: "正在準備語者辨識環境...", progress: nil))
+                    try await PythonEnvironmentManager.shared.ensureReady(
+                        for: .diarization,
+                        log: { _ in },
+                        pipProgress: { [weak self] info in
+                            Task { @MainActor in
+                                guard let self else { return }
+                                self.handlePipProgress(info, fileId: item.fileId, itemIndex: index, activePhases: activePhases)
+                            }
+                        }
+                    )
+                    snapshot.items[index].downloadProgress = nil
+                    snapshot.items[index].phase = initialPhase
+                    onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: initialPhase, activePhases: activePhases))
+                    onEvent?(.queueUpdated(snapshot))
+                }
+
+                let audioPath: String
+                if request.enhance {
+                    let tempURL = FileManager.default.temporaryDirectory
+                        .appendingPathComponent(UUID().uuidString)
+                        .appendingPathExtension("wav")
+                    enhancedTempURL = tempURL
+
+                    try await Self.runSpeechEnhancement(
+                        filePath: item.id,
+                        outputPath: tempURL.path,
+                        log: { [weak self] line in
+                            Task { @MainActor in
+                                guard let self else { return }
+                                self.onEvent?(.taskLog(fileId: item.fileId, message: line))
+                                self.onEvent?(.taskProgress(fileId: item.fileId, message: line, progress: nil))
+                            }
+                        },
+                        downloadProgress: { [weak self] filename, downloaded, total in
+                            Task { @MainActor in
+                                guard let self else { return }
+                                let info = Self.makeDownloadProgress(filename: filename, downloaded: downloaded, total: total)
+                                self.onEvent?(.taskDownloadProgress(fileId: item.fileId, info: info))
+                            }
+                        }
+                    )
+                    audioPath = tempURL.path
+
+                    // Transition to transcribing phase
+                    snapshot.items[index].message = "正在使用 SwiftWhisper 轉寫..."
+                    snapshot.items[index].progress = 15
+                    snapshot.items[index].phase = .transcribing
+                    snapshot.items[index].downloadProgress = nil
+                    syncInfo()
+                    onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: .transcribing, activePhases: activePhases))
+                    onEvent?(.taskProgress(fileId: item.fileId, message: "正在使用 SwiftWhisper 轉寫...", progress: 15))
+                    onEvent?(.queueUpdated(snapshot))
+                } else {
+                    audioPath = item.id
+                }
+
                 let result = try await Self.runHeadless(
-                    filePath: item.id,
+                    filePath: audioPath,
                     language: request.language,
                     diarize: false,
                     modelPreset: modelPreset,
@@ -144,16 +231,37 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                             guard let self else { return }
                             self.handleStreamEvent(streamEvent, itemIndex: index, fileId: item.fileId)
                         }
+                    },
+                    log: { [weak self] line in
+                        Task { @MainActor in
+                            guard let self else { return }
+                            self.onEvent?(.taskLog(fileId: item.fileId, message: line))
+                            self.onEvent?(.taskProgress(fileId: item.fileId, message: line, progress: nil))
+                        }
+                    },
+                    downloadProgress: { [weak self] filename, downloaded, total in
+                        Task { @MainActor in
+                            guard let self else { return }
+                            let info = Self.makeDownloadProgress(filename: filename, downloaded: downloaded, total: total)
+                            // Insert downloading phase if not already present
+                            if !self.snapshot.items[index].activePhases.contains(.downloading) {
+                                self.snapshot.items[index].activePhases.insert(.downloading, at: 0)
+                            }
+                            self.snapshot.items[index].phase = .downloading
+                            self.onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: .downloading, activePhases: self.snapshot.items[index].activePhases))
+                            self.onEvent?(.taskDownloadProgress(fileId: item.fileId, info: info))
+                        }
                     }
                 )
                 let finalResult: HeadlessResult
                 if request.diarize {
-                    updatePyannoteState(for: index)
+                    updatePyannoteState(for: index, activePhases: activePhases)
+                    onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: .diarizing, activePhases: activePhases))
                     onEvent?(.taskProgress(fileId: item.fileId, message: "正在使用 pyannote 進行多語者辨識...", progress: 70))
                     onEvent?(.queueUpdated(snapshot))
 
                     let diarizedSegments = try await Self.runPyannoteDiarization(
-                        filePath: item.id,
+                        filePath: audioPath,
                         token: request.token,
                         speakers: request.speakers,
                         segments: result.segments,
@@ -183,6 +291,10 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 onEvent?(.taskFailed(fileId: item.fileId, message: error.localizedDescription))
                 onEvent?(.queueUpdated(snapshot))
             }
+
+            if let tempURL = enhancedTempURL {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
         }
 
         snapshot.isProcessing = false
@@ -191,28 +303,46 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         onEvent?(.queueUpdated(snapshot))
     }
 
-    private func updateProcessingState(for index: Int, message: String) {
+    private func updateProcessingState(for index: Int, message: String, phase: ProcessingPhase? = nil, activePhases: [ProcessingPhase] = []) {
         for itemIndex in snapshot.items.indices {
             if itemIndex == index {
                 snapshot.items[itemIndex].status = "processing"
                 snapshot.items[itemIndex].message = message
-                snapshot.items[itemIndex].progress = 15
+                snapshot.items[itemIndex].progress = 5
+                snapshot.items[itemIndex].phase = phase
+                snapshot.items[itemIndex].activePhases = activePhases
+                snapshot.items[itemIndex].downloadProgress = nil
                 snapshot.currentFileId = snapshot.items[itemIndex].fileId
             } else if snapshot.items[itemIndex].status == "processing" {
                 snapshot.items[itemIndex].status = "pending"
                 snapshot.items[itemIndex].message = ""
                 snapshot.items[itemIndex].progress = 0
+                snapshot.items[itemIndex].phase = nil
+                snapshot.items[itemIndex].activePhases = []
+                snapshot.items[itemIndex].downloadProgress = nil
             }
         }
         snapshot.isProcessing = true
         syncInfo()
     }
 
-    private func updatePyannoteState(for index: Int) {
+    private func updatePyannoteState(for index: Int, activePhases: [ProcessingPhase] = []) {
         snapshot.items[index].status = "processing"
         snapshot.items[index].message = "正在使用 pyannote 進行多語者辨識..."
         snapshot.items[index].progress = 70
+        snapshot.items[index].phase = .diarizing
+        snapshot.items[index].activePhases = activePhases
+        snapshot.items[index].downloadProgress = nil
         syncInfo()
+    }
+
+    private static func makeDownloadProgress(filename: String, downloaded: Int64, total: Int64) -> DownloadProgress {
+        DownloadProgress(
+            filename: filename,
+            bytesDownloaded: downloaded,
+            totalBytes: total,
+            bytesPerSecond: 0
+        )
     }
 
     private func applyResult(_ result: HeadlessResult, to index: Int, diarizeRequested: Bool, usedPyannote: Bool) {
@@ -245,7 +375,44 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         syncInfo()
     }
 
+    private func handlePipProgress(_ info: PipDownloadInfo, fileId: String, itemIndex: Int, activePhases: [ProcessingPhase]) {
+        guard itemIndex < snapshot.items.count else { return }
+
+        // Show download phase in segmented bar
+        if !snapshot.items[itemIndex].activePhases.contains(.downloading) {
+            snapshot.items[itemIndex].activePhases.insert(.downloading, at: 0)
+        }
+        snapshot.items[itemIndex].phase = .downloading
+
+        let statusLabel: String
+        switch info.status {
+        case "Downloading": statusLabel = "正在下載套件..."
+        case "Installing": statusLabel = "正在安裝套件..."
+        case "Collecting": statusLabel = "正在收集套件..."
+        case "Done": statusLabel = "安裝完成"
+        default: statusLabel = "正在準備環境..."
+        }
+
+        let dlInfo = DownloadProgress(
+            filename: statusLabel,
+            bytesDownloaded: info.downloadedBytes,
+            totalBytes: info.totalBytes,
+            bytesPerSecond: 0
+        )
+        snapshot.items[itemIndex].downloadProgress = dlInfo
+        syncInfo()
+
+        onEvent?(.taskPhaseChanged(fileId: fileId, phase: .downloading, activePhases: snapshot.items[itemIndex].activePhases))
+        onEvent?(.taskDownloadProgress(fileId: fileId, info: dlInfo))
+        onEvent?(.queueUpdated(snapshot))
+    }
+
     private func handleStreamEvent(_ event: HeadlessStreamEvent, itemIndex: Int, fileId: String) {
+        // Ignore stale events if we've already moved past the transcribing phase
+        guard itemIndex < snapshot.items.count,
+              snapshot.items[itemIndex].phase == .transcribing || snapshot.items[itemIndex].phase == nil
+        else { return }
+
         switch event {
         case .progress(let progress):
             let percentage = Int((progress * 100.0).rounded())
@@ -343,12 +510,16 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         language: String,
         diarize: Bool,
         modelPreset: WhisperModelPreset,
-        event: @escaping @Sendable (HeadlessStreamEvent) -> Void
+        event: @escaping @Sendable (HeadlessStreamEvent) -> Void,
+        log: @escaping @Sendable (String) -> Void = { _ in },
+        downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void = { _, _, _ in }
     ) async throws -> HeadlessResult {
-        try await Task.detached(priority: .userInitiated) {
+        // Download CoreML encoder if needed (async, with progress)
+        let modelDir = try PathResolver.swiftWhisperModelDirectory()
+        try await syncCoreMLAssetsIfAvailable(for: modelPreset, into: modelDir, downloadProgress: downloadProgress)
+
+        return try await Task.detached(priority: .userInitiated) {
             let executable = try PathResolver.swiftWhisperExecutable()
-            let modelDir = try PathResolver.swiftWhisperModelDirectory()
-            try syncCoreMLAssetsIfAvailable(for: modelPreset, into: modelDir)
 
             let process = Process()
             process.executableURL = executable
@@ -394,9 +565,33 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 }
             }
 
+            let stderrCollector = StreamCollector()
+            let stderrHandle = stderr.fileHandleForReading
+            stderrHandle.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty else { return }
+                let lines = stderrCollector.append(data)
+                for line in lines {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { continue }
+                    if let dl = Self.parseDownloadLine(trimmed) {
+                        downloadProgress(dl.0, dl.1, dl.2)
+                    } else if trimmed.contains("downloading model") {
+                        log("正在下載模型...")
+                    } else if trimmed.contains("model ready") || trimmed.contains("model stored") {
+                        log("模型已就緒")
+                    } else if trimmed.contains("ensuring model") {
+                        log("正在準備模型...")
+                    } else {
+                        log(trimmed)
+                    }
+                }
+            }
+
             try process.run()
             process.waitUntilExit()
             stdoutHandle.readabilityHandler = nil
+            stderrHandle.readabilityHandler = nil
 
             let remainingStdout = stdout.fileHandleForReading.readDataToEndOfFile()
             if !remainingStdout.isEmpty {
@@ -417,8 +612,8 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     }
                 }
             }
-            let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
-            let stderrText = String(data: stderrData, encoding: .utf8)?
+            let remainingStderr = stderr.fileHandleForReading.readDataToEndOfFile()
+            let stderrText = String(data: remainingStderr, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
             guard process.terminationStatus == 0 else {
@@ -441,21 +636,182 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         }.value
     }
 
-    nonisolated private static func syncCoreMLAssetsIfAvailable(for modelPreset: WhisperModelPreset, into modelDir: URL) throws {
+    // MARK: - CoreML Encoder Auto-Download
+
+    private static func syncCoreMLAssetsIfAvailable(
+        for modelPreset: WhisperModelPreset,
+        into modelDir: URL,
+        downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void
+    ) async throws {
         let fileManager = FileManager.default
+
+        let modelcName = modelPreset.filename.replacingOccurrences(of: ".bin", with: "-encoder.mlmodelc")
+        let destinationModelc = modelDir.appendingPathComponent(modelcName, isDirectory: true)
+        let partialDestination = modelDir.appendingPathComponent(modelcName + ".downloading", isDirectory: true)
+
+        // Clean up incomplete downloads from previous crash
+        if fileManager.fileExists(atPath: partialDestination.path) {
+            try? fileManager.removeItem(at: partialDestination)
+        }
+
+        // 1. Already exists locally
+        if fileManager.fileExists(atPath: destinationModelc.path) { return }
+
+        // 2. Bundle / dev path
+        if let source = PathResolver.swiftWhisperCoreMLCompiledModel(named: modelcName) {
+            try? fileManager.removeItem(at: destinationModelc)
+            try fileManager.copyItem(at: source, to: destinationModelc)
+            return
+        }
+
+        // 3. .mlpackage fallback from bundle / dev path
         let packageName = modelPreset.filename.replacingOccurrences(of: ".bin", with: "-encoder.mlpackage")
-
-        guard let sourcePackage = PathResolver.swiftWhisperCoreMLPackage(named: packageName) else {
-            return
-        }
-
         let destinationPackage = modelDir.appendingPathComponent(packageName, isDirectory: true)
-        if fileManager.fileExists(atPath: destinationPackage.path) {
+        if fileManager.fileExists(atPath: destinationPackage.path) { return }
+        if let source = PathResolver.swiftWhisperCoreMLPackage(named: packageName) {
+            try? fileManager.removeItem(at: destinationPackage)
+            try fileManager.copyItem(at: source, to: destinationPackage)
             return
         }
 
-        try? fileManager.removeItem(at: destinationPackage)
-        try fileManager.copyItem(at: sourcePackage, to: destinationPackage)
+        // 4. Download .mlmodelc.zip from HuggingFace
+        guard let remoteURL = modelPreset.coreMLEncoderRemoteURL else { return }
+
+        let zipFilename = "\(modelcName).zip"
+        let tempZip = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("zip")
+
+        try await downloadFile(from: remoteURL, to: tempZip, progressHandler: { downloaded, total in
+            downloadProgress(zipFilename, downloaded, total)
+        })
+
+        defer { try? fileManager.removeItem(at: tempZip) }
+
+        // Unzip
+        let tempExtract = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+        try fileManager.createDirectory(at: tempExtract, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: tempExtract) }
+
+        try await Task.detached {
+            let unzip = Process()
+            unzip.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
+            unzip.arguments = ["-o", tempZip.path, "-d", tempExtract.path]
+            unzip.standardOutput = FileHandle.nullDevice
+            unzip.standardError = FileHandle.nullDevice
+            try unzip.run()
+            unzip.waitUntilExit()
+            guard unzip.terminationStatus == 0 else {
+                throw NSError(
+                    domain: "SwiftWhisperProvider",
+                    code: Int(unzip.terminationStatus),
+                    userInfo: [NSLocalizedDescriptionKey: "CoreML encoder 解壓失敗"]
+                )
+            }
+        }.value
+
+        let extracted = tempExtract.appendingPathComponent(modelcName, isDirectory: true)
+        if fileManager.fileExists(atPath: extracted.path) {
+            // Move to .downloading first, then rename — atomic guarantee
+            try? fileManager.removeItem(at: partialDestination)
+            try fileManager.moveItem(at: extracted, to: partialDestination)
+            try? fileManager.removeItem(at: destinationModelc)
+            try fileManager.moveItem(at: partialDestination, to: destinationModelc)
+        }
+    }
+
+    // MARK: - Generic Download Helper
+
+    private static func downloadFile(
+        from url: URL,
+        to destination: URL,
+        progressHandler: @escaping @Sendable (Int64, Int64) -> Void
+    ) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let delegate = FileDownloadDelegate(
+                destination: destination,
+                progressHandler: progressHandler,
+                continuation: continuation
+            )
+            let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+            session.downloadTask(with: url).resume()
+        }
+    }
+
+    // MARK: - Stderr Download Line Parser
+
+    nonisolated private static func parseDownloadLine(_ line: String) -> (String, Int64, Int64)? {
+        // Format: [DOWNLOAD] <filename> <downloaded> <total>
+        // Also handles: [swiftwhisper] [DOWNLOAD] <filename> <downloaded> <total>
+        let trimmed: String
+        if line.hasPrefix("[swiftwhisper] [DOWNLOAD] ") {
+            trimmed = String(line.dropFirst("[swiftwhisper] [DOWNLOAD] ".count))
+        } else if line.hasPrefix("[DOWNLOAD] ") {
+            trimmed = String(line.dropFirst("[DOWNLOAD] ".count))
+        } else {
+            return nil
+        }
+        let parts = trimmed.split(separator: " ")
+        guard parts.count >= 3,
+              let downloaded = Int64(parts[parts.count - 2]),
+              let total = Int64(parts[parts.count - 1]) else { return nil }
+        let filename = parts[0..<(parts.count - 2)].joined(separator: " ")
+        return (filename, downloaded, total)
+    }
+
+    // MARK: - Speech Enhancement
+
+    private static func runSpeechEnhancement(
+        filePath: String,
+        outputPath: String,
+        log: @escaping @Sendable (String) -> Void,
+        downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void = { _, _, _ in }
+    ) async throws {
+        try await Task.detached(priority: .userInitiated) {
+            let python = try PathResolver.pythonExecutable()
+            let helper = try PathResolver.enhancementHelperScript()
+
+            let process = Process()
+            process.executableURL = python
+            process.arguments = [helper.path, "enhance", filePath, outputPath]
+            process.environment = try PathResolver.backendEnvironment()
+
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardOutput = stdout
+            process.standardError = stderr
+
+            let stderrHandle = stderr.fileHandleForReading
+            stderrHandle.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty else { return }
+                let text = String(decoding: data, as: UTF8.self)
+                for line in text.split(whereSeparator: \.isNewline) {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { continue }
+                    if let dl = parseDownloadLine(trimmed) {
+                        downloadProgress(dl.0, dl.1, dl.2)
+                    } else {
+                        log(trimmed)
+                    }
+                }
+            }
+
+            try process.run()
+            process.waitUntilExit()
+            stderrHandle.readabilityHandler = nil
+
+            guard process.terminationStatus == 0 else {
+                let stderrText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                throw NSError(
+                    domain: "SwiftWhisperProvider",
+                    code: Int(process.terminationStatus),
+                    userInfo: [NSLocalizedDescriptionKey: stderrText.isEmpty ? "人聲加強失敗（exit code \(process.terminationStatus)）" : stderrText]
+                )
+            }
+        }.value
     }
 
     private static func verifyHuggingFaceToken(_ token: String) async throws -> TokenVerificationResult {
@@ -497,6 +853,153 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         }.value
     }
 
+    /// Convert any audio file to 16-bit PCM WAV using AVFoundation (no ffmpeg needed).
+    private static func convertToWAV(inputPath: String, outputPath: String) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            let inputURL = URL(fileURLWithPath: inputPath)
+            let outputURL = URL(fileURLWithPath: outputPath)
+
+            // Remove existing output if any
+            try? FileManager.default.removeItem(at: outputURL)
+
+            guard let asset = try? AVAudioFile(forReading: inputURL) else {
+                // Fallback: use AVAsset for non-WAV formats
+                let avAsset = AVURLAsset(url: inputURL)
+                guard let exportSession = AVAssetExportSession(asset: avAsset, presetName: AVAssetExportPresetPassthrough) else {
+                    continuation.resume(throwing: NSError(
+                        domain: "SwiftWhisperProvider", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "無法建立音訊轉換 session"]
+                    ))
+                    return
+                }
+                // Use AVAssetReader/Writer for proper PCM conversion
+                Self.convertWithAVAsset(inputURL: inputURL, outputURL: outputURL) { error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume()
+                    }
+                }
+                return
+            }
+
+            // Input is already readable by AVAudioFile — convert to 16-bit PCM WAV
+            let format = asset.processingFormat
+            guard let outputFormat = AVAudioFormat(
+                commonFormat: .pcmFormatInt16,
+                sampleRate: format.sampleRate,
+                channels: 1,
+                interleaved: true
+            ) else {
+                continuation.resume(throwing: NSError(
+                    domain: "SwiftWhisperProvider", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "無法建立輸出音訊格式"]
+                ))
+                return
+            }
+
+            do {
+                let outputFile = try AVAudioFile(
+                    forWriting: outputURL,
+                    settings: outputFormat.settings,
+                    commonFormat: .pcmFormatInt16,
+                    interleaved: true
+                )
+
+                guard let converter = AVAudioConverter(from: format, to: outputFormat) else {
+                    continuation.resume(throwing: NSError(
+                        domain: "SwiftWhisperProvider", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "無法建立音訊轉換器"]
+                    ))
+                    return
+                }
+
+                let bufferSize: AVAudioFrameCount = 8192
+                guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: bufferSize),
+                      let outputBuffer = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: bufferSize) else {
+                    continuation.resume(throwing: NSError(
+                        domain: "SwiftWhisperProvider", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "無法建立音訊緩衝區"]
+                    ))
+                    return
+                }
+
+                while asset.framePosition < asset.length {
+                    let framesToRead = min(bufferSize, AVAudioFrameCount(asset.length - asset.framePosition))
+                    try asset.read(into: inputBuffer, frameCount: framesToRead)
+
+                    var error: NSError?
+                    converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+                        outStatus.pointee = .haveData
+                        return inputBuffer
+                    }
+                    if let error { throw error }
+
+                    try outputFile.write(from: outputBuffer)
+                }
+
+                continuation.resume()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private static func convertWithAVAsset(inputURL: URL, outputURL: URL, completion: @escaping (Error?) -> Void) {
+        let asset = AVURLAsset(url: inputURL)
+        let outputSettings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 16000,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 16,
+            AVLinearPCMIsFloatKey: false,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+
+        guard let reader = try? AVAssetReader(asset: asset) else {
+            completion(NSError(domain: "SwiftWhisperProvider", code: 1,
+                               userInfo: [NSLocalizedDescriptionKey: "無法讀取音訊檔案"]))
+            return
+        }
+
+        guard let track = asset.tracks(withMediaType: .audio).first else {
+            completion(NSError(domain: "SwiftWhisperProvider", code: 1,
+                               userInfo: [NSLocalizedDescriptionKey: "音訊檔案沒有音軌"]))
+            return
+        }
+
+        let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
+        reader.add(readerOutput)
+
+        guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .wav) else {
+            completion(NSError(domain: "SwiftWhisperProvider", code: 1,
+                               userInfo: [NSLocalizedDescriptionKey: "無法建立 WAV 寫入器"]))
+            return
+        }
+
+        let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: outputSettings)
+        writer.add(writerInput)
+
+        reader.startReading()
+        writer.startWriting()
+        writer.startSession(atSourceTime: .zero)
+
+        writerInput.requestMediaDataWhenReady(on: DispatchQueue(label: "wav-convert")) {
+            while writerInput.isReadyForMoreMediaData {
+                if let buffer = readerOutput.copyNextSampleBuffer() {
+                    writerInput.append(buffer)
+                } else {
+                    writerInput.markAsFinished()
+                    writer.finishWriting {
+                        completion(writer.error)
+                    }
+                    return
+                }
+            }
+        }
+    }
+
     private static func runPyannoteDiarization(
         filePath: String,
         token: String,
@@ -504,7 +1007,16 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         segments: [HeadlessSegment],
         log: @escaping @Sendable (String) -> Void
     ) async throws -> [HeadlessSegment] {
-        try await Task.detached(priority: .userInitiated) {
+        // Convert audio to WAV using AVFoundation (no ffmpeg needed)
+        let wavURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension("wav")
+        defer { try? FileManager.default.removeItem(at: wavURL) }
+
+        log("正在將音訊轉換為 WAV 格式...")
+        try await convertToWAV(inputPath: filePath, outputPath: wavURL.path)
+
+        return try await Task.detached(priority: .userInitiated) {
             let python = try PathResolver.pythonExecutable()
             let helper = try PathResolver.diarizationHelperScript()
 
@@ -529,7 +1041,8 @@ final class SwiftWhisperProvider: TranscriptionProvider {
 
                 let process = Process()
                 process.executableURL = python
-                var args = [helper.path, "diarize", filePath, token, tempURL.path]
+                // Pass --wav flag so Python script reads WAV directly without ffmpeg
+                var args = [helper.path, "diarize", wavURL.path, token, tempURL.path, "--wav"]
                 if speakers > 0 {
                     args.append(String(speakers))
                 }
@@ -691,4 +1204,56 @@ private struct DatasetsSegment: Codable {
 
 private struct PyannoteResult: Codable {
     let segments: [HeadlessSegment]
+}
+
+private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {
+    private let destination: URL
+    private let progressHandler: (Int64, Int64) -> Void
+    private let continuation: CheckedContinuation<Void, Error>
+    private var resumed = false
+    private var lastReportTime: TimeInterval = 0
+
+    init(destination: URL, progressHandler: @escaping (Int64, Int64) -> Void, continuation: CheckedContinuation<Void, Error>) {
+        self.destination = destination
+        self.progressHandler = progressHandler
+        self.continuation = continuation
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastReportTime >= 0.3 else { return }
+        lastReportTime = now
+        let total = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : 0
+        progressHandler(totalBytesWritten, total)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        guard !resumed else { return }
+        resumed = true
+        do {
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.moveItem(at: location, to: destination)
+            continuation.resume()
+        } catch {
+            continuation.resume(throwing: error)
+        }
+        session.finishTasksAndInvalidate()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard !resumed else { return }
+        resumed = true
+        if let error {
+            continuation.resume(throwing: error)
+        } else if let http = task.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            continuation.resume(throwing: NSError(
+                domain: "SwiftWhisperProvider",
+                code: http.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: "下載失敗 HTTP \(http.statusCode)"]
+            ))
+        }
+        session.finishTasksAndInvalidate()
+    }
 }

@@ -16,6 +16,7 @@ final class NativeAppModel: ObservableObject {
     @Published var isDraggingFiles = false
     @Published var isFileImporterPresented = false
     @Published var diarizeEnabled = false
+    @Published var enhancementEnabled = false
     @Published var speakers = 0
     @Published var token = ""
     @Published var tokenStatus = ""
@@ -27,8 +28,9 @@ final class NativeAppModel: ObservableObject {
     @Published var diagnosticLogLines: [String] = []
     @Published var floatingLines: [FloatingLineModel] = []
     @Published private(set) var providerInfo: ProviderInfo?
+    @Published var selectedModelPreset: WhisperModelPreset = .default
 
-    private let provider: TranscriptionProvider
+    private var provider: TranscriptionProvider
     private let dialogs: DialogService
     private var pendingFloatingFragments: [String] = []
     private var floatingDrainTask: Task<Void, Never>?
@@ -120,14 +122,44 @@ final class NativeAppModel: ObservableObject {
     }
 
     func toggleSettings() {
-        withAnimation(.easeInOut(duration: 0.24)) {
+        withAnimation(.linear(duration: 0.22)) {
             showSettings.toggle()
         }
     }
 
     func closeSettings() {
-        withAnimation(.easeInOut(duration: 0.24)) {
+        withAnimation(.linear(duration: 0.22)) {
             showSettings = false
+        }
+    }
+
+    func switchModel(to preset: WhisperModelPreset) {
+        guard preset != selectedModelPreset else { return }
+        guard !isProcessing else {
+            setActionStatus("轉譯中無法切換模型", tone: .error)
+            return
+        }
+
+        provider.shutdown()
+        selectedModelPreset = preset
+
+        let newProvider = SwiftWhisperProvider(modelPreset: preset)
+        newProvider.onEvent = { [weak self] event in
+            Task { @MainActor in
+                self?.handle(event: event)
+            }
+        }
+        self.provider = newProvider
+
+        do {
+            try provider.start()
+            Task {
+                let info = try await provider.getInfo()
+                providerInfo = info
+                setActionStatus("已切換到 \(preset.displayName)", tone: .success)
+            }
+        } catch {
+            setActionStatus("切換模型失敗: \(error.localizedDescription)", tone: .error)
         }
     }
 
@@ -203,7 +235,8 @@ final class NativeAppModel: ObservableObject {
                         language: "zh",
                         diarize: diarizeEnabled,
                         speakers: speakers,
-                        token: token.trimmingCharacters(in: .whitespacesAndNewlines)
+                        token: token.trimmingCharacters(in: .whitespacesAndNewlines),
+                        enhance: enhancementEnabled
                     )
                 )
                 applySnapshot(snapshot)
@@ -327,6 +360,20 @@ final class NativeAppModel: ObservableObject {
         case .taskStopped(_, let message):
             stopFloatingTranscript(clearVisible: true)
             setActionStatus(message, tone: .error)
+        case .taskPhaseChanged(let fileId, let phase, let activePhases):
+            if let idx = queueItems.firstIndex(where: { $0.fileId == fileId }) {
+                queueItems[idx].phase = phase
+                queueItems[idx].activePhases = activePhases
+                queueItems[idx].downloadProgress = nil
+            }
+        case .taskDownloadProgress(let fileId, let info):
+            if let idx = queueItems.firstIndex(where: { $0.fileId == fileId }) {
+                queueItems[idx].downloadProgress = info
+                if !queueItems[idx].activePhases.contains(.downloading) {
+                    queueItems[idx].activePhases.insert(.downloading, at: 0)
+                }
+                queueItems[idx].phase = .downloading
+            }
         case .backendError(let message):
             stopFloatingTranscript(clearVisible: true)
             setActionStatus(message, tone: .error)

@@ -36,10 +36,7 @@ struct RootView: View {
 
                 if model.showSettings {
                     settingsOverlay
-                        .transition(.asymmetric(
-                            insertion: .move(edge: .trailing).combined(with: .opacity),
-                            removal: .move(edge: .trailing).combined(with: .opacity)
-                        ))
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
         }
@@ -462,12 +459,12 @@ struct RootView: View {
                 }
                 .transition(.opacity)
 
-            VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 0) {
                 HStack(alignment: .center) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("設定")
                             .font(.system(size: 26, weight: .bold))
-                        Text("語者辨識與帳號")
+                        Text("語者辨識與模型")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(secondaryInk)
                     }
@@ -478,6 +475,10 @@ struct RootView: View {
                     .buttonStyle(SecondaryActionButtonStyle())
                     .font(.system(size: 24, weight: .regular))
                 }
+                .padding(.bottom, 22)
+
+                ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 22) {
 
                 VStack(alignment: .leading, spacing: 12) {
                     Toggle(isOn: $model.diarizeEnabled) {
@@ -486,6 +487,25 @@ struct RootView: View {
                                 .font(.system(size: 15, weight: .semibold))
                                 .foregroundStyle(primaryInk)
                             Text("開啟後會在轉譯完成後辨識不同說話者。")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(secondaryInk)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                }
+                .padding(18)
+                .background(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .fill(Color.white.opacity(0.32))
+                )
+
+                VStack(alignment: .leading, spacing: 12) {
+                    Toggle(isOn: $model.enhancementEnabled) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("啟用人聲加強（beta）")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(primaryInk)
+                            Text("轉譯前先降噪增清，適合嘈雜環境錄音。會增加前處理時間。")
                                 .font(.system(size: 13, weight: .medium))
                                 .foregroundStyle(secondaryInk)
                         }
@@ -554,12 +574,37 @@ struct RootView: View {
                 .animation(.easeInOut(duration: 0.22), value: model.diarizeEnabled)
 
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("目前模型")
+                    Text("辨識模型")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(primaryInk)
-                    Text("\(model.providerInfo?.model ?? "載入中") ・ zh ・ SwiftWhisper")
-                        .font(.system(size: 14, weight: .medium))
+                    Text("切換後首次使用會自動下載模型。")
+                        .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(secondaryInk)
+
+                    ForEach(WhisperModelPreset.allCases, id: \.rawValue) { preset in
+                        Button {
+                            model.switchModel(to: preset)
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: model.selectedModelPreset == preset ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(model.selectedModelPreset == preset ? Color.accentColor : secondaryInk)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(preset.displayName)
+                                        .font(.system(size: 13, weight: model.selectedModelPreset == preset ? .bold : .medium))
+                                        .foregroundStyle(primaryInk)
+                                    Text(preset.sizeHint)
+                                        .font(.system(size: 11, weight: .medium))
+                                        .foregroundStyle(secondaryInk)
+                                }
+                                Spacer()
+                            }
+                            .padding(.vertical, 6)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.isProcessing)
+                    }
 
                     if !model.tokenStatus.isEmpty {
                         Text(model.tokenStatus)
@@ -574,18 +619,20 @@ struct RootView: View {
                         .fill(Color.white.opacity(0.24))
                 )
 
-                Spacer(minLength: 0)
+                }
+                }
             }
             .padding(24)
             .frame(width: 340)
-            .frame(maxHeight: 560, alignment: .top)
+            .frame(maxHeight: .infinity, alignment: .top)
             .foregroundStyle(primaryInk)
             .drawerGlass(cornerRadius: 28)
             .padding(.top, 84)
+            .padding(.bottom, 26)
             .padding(.trailing, 24)
             .shadow(color: Color(red: 0.28, green: 0.20, blue: 0.12).opacity(0.05), radius: 18, x: -4, y: 6)
         }
-        .animation(.easeInOut(duration: 0.24), value: model.showSettings)
+        .animation(.linear(duration: 0.22), value: model.showSettings)
     }
 
     private func loadDroppedPaths(from providers: [NSItemProvider]) {
@@ -791,9 +838,16 @@ private struct QueueRow: View {
                 }
 
                 if item.status == "processing" {
-                    ProgressView(value: Double(max(item.progress, 5)), total: 100)
-                        .progressViewStyle(.linear)
-                        .tint(primaryProgress)
+                    SegmentedProgressBar(
+                        progress: item.progress,
+                        phase: item.phase,
+                        activePhases: item.activePhases
+                    )
+
+                    if let dl = item.downloadProgress, item.phase == .downloading {
+                        DownloadInfoCard(info: dl)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
                 }
             }
         }
@@ -865,6 +919,151 @@ private struct QueueRow: View {
 
     private var primaryProgress: Color {
         Color(red: 0.18, green: 0.16, blue: 0.14).opacity(0.82)
+    }
+}
+
+// MARK: - Segmented Progress Bar
+
+private struct SegmentedProgressBar: View {
+    let progress: Int
+    let phase: ProcessingPhase?
+    let activePhases: [ProcessingPhase]
+
+    private struct Segment: Identifiable {
+        let id: ProcessingPhase
+        let fraction: Double  // width fraction (0-1) of the total bar
+        let color: Color
+    }
+
+    private var segments: [Segment] {
+        guard !activePhases.isEmpty else {
+            return [Segment(id: .transcribing, fraction: 1.0, color: ProcessingPhase.transcribing.color)]
+        }
+
+        let weights: [(ProcessingPhase, Double)] = activePhases.map { p in
+            switch p {
+            case .downloading:  return (p, 0.10)
+            case .enhancing:    return (p, 0.10)
+            case .transcribing: return (p, activePhases.contains(.diarizing) ? 0.55 : 0.80)
+            case .diarizing:    return (p, 0.25)
+            }
+        }
+        let totalWeight = weights.reduce(0.0) { $0 + $1.1 }
+        return weights.map { Segment(id: $0.0, fraction: $0.1 / totalWeight, color: $0.0.color) }
+    }
+
+    private var currentPhaseIndex: Int {
+        guard let phase else { return 0 }
+        return activePhases.firstIndex(of: phase) ?? 0
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            HStack(spacing: 2) {
+                ForEach(Array(segments.enumerated()), id: \.element.id) { index, segment in
+                    let phaseIdx = currentPhaseIndex
+                    let state: SegmentState = {
+                        if index < phaseIdx {
+                            return .completed
+                        } else if index == phaseIdx {
+                            return .active
+                        } else {
+                            return .pending
+                        }
+                    }()
+
+                    let fillFraction: Double = {
+                        switch state {
+                        case .completed: return 1.0
+                        case .pending: return 0.0
+                        case .active:
+                            if segment.id == .transcribing {
+                                // Transcribing has real 0-100 progress from whisper
+                                return max(0.05, min(Double(progress) / 96.0, 1.0))
+                            } else {
+                                // Other phases: show ~40% fill as indeterminate active
+                                return 0.4
+                            }
+                        }
+                    }()
+
+                    let segWidth = segment.fraction * (geo.size.width - CGFloat(max(segments.count - 1, 0)) * 2)
+
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 3, style: .continuous)
+                            .fill(segment.color.opacity(0.15))
+                            .frame(width: segWidth)
+
+                        RoundedRectangle(cornerRadius: 3, style: .continuous)
+                            .fill(segment.color)
+                            .frame(width: max(segWidth * fillFraction, fillFraction > 0 ? 3 : 0))
+                            .opacity(state == .active ? 1.0 : (state == .completed ? 0.85 : 0.3))
+                    }
+                    .frame(width: segWidth)
+                    .animation(.easeInOut(duration: 0.4), value: fillFraction)
+                    .animation(.easeInOut(duration: 0.3), value: state == .active)
+                }
+            }
+        }
+        .frame(height: 6)
+    }
+
+    private enum SegmentState {
+        case completed, active, pending
+    }
+}
+
+// MARK: - Download Info Card
+
+private struct DownloadInfoCard: View {
+    let info: DownloadProgress
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.down.circle.fill")
+                .foregroundStyle(ProcessingPhase.downloading.color)
+                .font(.system(size: 16))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(info.filename)
+                    .font(.system(size: 11, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                HStack(spacing: 4) {
+                    Text("\(info.formattedDownloaded) / \(info.formattedTotal)")
+                        .font(.system(size: 10, weight: .regular, design: .monospaced))
+                        .foregroundStyle(.secondary)
+
+                    if info.bytesPerSecond > 0 {
+                        Text("· \(info.formattedSpeed)")
+                            .font(.system(size: 10, weight: .regular, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Spacer()
+
+            if let eta = info.estimatedSecondsRemaining, eta > 0 && eta < 3600 {
+                Text("剩餘 \(Int(eta))s")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text("\(Int(info.fractionCompleted * 100))%")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(ProcessingPhase.downloading.color)
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(ProcessingPhase.downloading.color.opacity(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(ProcessingPhase.downloading.color.opacity(0.15), lineWidth: 1)
+                )
+        )
     }
 }
 

@@ -12,16 +12,19 @@ enum ResolverError: Error, LocalizedError {
 }
 
 enum PathResolver {
-    static func repoRoot() -> URL {
-        URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
+    /// Whether the app is running from a .app bundle (vs Xcode/dev build).
+    private static var isRunningFromBundle: Bool {
+        Bundle.main.bundlePath.hasSuffix(".app")
     }
 
-    static func workspaceRoot() -> URL {
-        repoRoot().appendingPathComponent("desktop-appkit", isDirectory: true)
+    /// Dev-only: repo root derived from source file path. Returns nil when running from bundle.
+    private static func devRepoRoot() -> URL? {
+        guard !isRunningFromBundle else { return nil }
+        return URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
     }
 
     static func appSupportDirectory() throws -> URL {
@@ -89,29 +92,60 @@ enum PathResolver {
         throw ResolverError.missingPath("找不到可用的下載檔名")
     }
 
+    // MARK: - Python
+
+    static func managedPythonVenv() throws -> URL {
+        try appSupportDirectory()
+            .appendingPathComponent("python-env/bin/python3", isDirectory: false)
+    }
+
     static func pythonExecutable() throws -> URL {
-        let bundled = Bundle.main.resourceURL?
-            .appendingPathComponent("desktop/runtime/python/bin/python3", isDirectory: false)
-        if let bundled, FileManager.default.isExecutableFile(atPath: bundled.path) {
+        // 1. Bundled runtime
+        if let bundled = Bundle.main.resourceURL?
+            .appendingPathComponent("desktop/runtime/python/bin/python3", isDirectory: false),
+           FileManager.default.isExecutableFile(atPath: bundled.path) {
             return bundled
         }
 
-        let workspace = workspaceRoot().appendingPathComponent(".venv/bin/python", isDirectory: false)
-        if FileManager.default.isExecutableFile(atPath: workspace.path) {
-            return workspace
+        // 2. Managed venv (auto-created by PythonEnvironmentManager)
+        if let managed = try? managedPythonVenv(),
+           FileManager.default.isExecutableFile(atPath: managed.path) {
+            return managed
         }
 
-        let repo = repoRoot().appendingPathComponent("venv/bin/python", isDirectory: false)
-        if FileManager.default.isExecutableFile(atPath: repo.path) {
-            return repo
+        // 3. Dev-only: workspace venv
+        if let root = devRepoRoot() {
+            let workspace = root.appendingPathComponent("desktop-appkit/.venv/bin/python", isDirectory: false)
+            if FileManager.default.isExecutableFile(atPath: workspace.path) {
+                return workspace
+            }
+            let repo = root.appendingPathComponent("venv/bin/python", isDirectory: false)
+            if FileManager.default.isExecutableFile(atPath: repo.path) {
+                return repo
+            }
         }
 
-        if FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/python3.11") {
-            return URL(fileURLWithPath: "/opt/homebrew/bin/python3.11")
+        // 4. System Python
+        let systemFallbacks = [
+            "/opt/homebrew/bin/python3",
+            "/opt/homebrew/bin/python3.12",
+            "/opt/homebrew/bin/python3.11",
+            "/usr/local/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
+            "/usr/bin/python3",
+        ]
+        for path in systemFallbacks {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return URL(fileURLWithPath: path)
+            }
         }
 
-        throw ResolverError.missingPath("找不到 Python 執行檔")
+        throw ResolverError.missingPath("找不到 Python 環境")
     }
+
+    // MARK: - Scripts
 
     static func backendScript() throws -> URL {
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("desktop/python_backend.py"),
@@ -119,11 +153,12 @@ enum PathResolver {
             return bundled
         }
 
-        let dev = repoRoot().appendingPathComponent("desktop/python_backend.py", isDirectory: false)
-        guard FileManager.default.fileExists(atPath: dev.path) else {
-            throw ResolverError.missingPath("找不到桌面版 backend 腳本")
+        if let dev = devRepoRoot()?.appendingPathComponent("desktop/python_backend.py", isDirectory: false),
+           FileManager.default.fileExists(atPath: dev.path) {
+            return dev
         }
-        return dev
+
+        throw ResolverError.missingPath("找不到桌面版 backend 腳本")
     }
 
     static func diarizationHelperScript() throws -> URL {
@@ -132,19 +167,37 @@ enum PathResolver {
             return bundled
         }
 
-        let dev = repoRoot().appendingPathComponent("desktop-appkit/python/pyannote_diarize.py", isDirectory: false)
-        guard FileManager.default.fileExists(atPath: dev.path) else {
-            throw ResolverError.missingPath("找不到 pyannote diarization helper")
+        if let dev = devRepoRoot()?.appendingPathComponent("desktop-appkit/python/pyannote_diarize.py", isDirectory: false),
+           FileManager.default.fileExists(atPath: dev.path) {
+            return dev
         }
-        return dev
+
+        throw ResolverError.missingPath("找不到 pyannote diarization helper")
     }
+
+    static func enhancementHelperScript() throws -> URL {
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("python/speech_enhance.py"),
+           FileManager.default.fileExists(atPath: bundled.path) {
+            return bundled
+        }
+
+        if let dev = devRepoRoot()?.appendingPathComponent("desktop-appkit/python/speech_enhance.py", isDirectory: false),
+           FileManager.default.fileExists(atPath: dev.path) {
+            return dev
+        }
+
+        throw ResolverError.missingPath("找不到 speech enhancement helper")
+    }
+
+    // MARK: - Binaries
 
     static func desktopWorkingDirectory() -> URL {
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("desktop", isDirectory: true),
            FileManager.default.fileExists(atPath: bundled.path) {
             return bundled
         }
-        return repoRoot().appendingPathComponent("desktop", isDirectory: true)
+        return devRepoRoot()?.appendingPathComponent("desktop", isDirectory: true)
+            ?? Bundle.main.bundleURL
     }
 
     static func swiftWhisperExecutable() throws -> URL {
@@ -153,14 +206,16 @@ enum PathResolver {
             return bundled
         }
 
-        let packageRoot = repoRoot().appendingPathComponent("desktop-appkit/swiftwhisper-core", isDirectory: true)
-        let binPath = packageRoot.appendingPathComponent(".build/apple/Products/Release/scribby-swiftwhisper-headless")
-        if FileManager.default.isExecutableFile(atPath: binPath.path) {
-            return binPath
+        if let dev = devRepoRoot()?
+            .appendingPathComponent("desktop-appkit/swiftwhisper-core/.build/apple/Products/Release/scribby-swiftwhisper-headless"),
+           FileManager.default.isExecutableFile(atPath: dev.path) {
+            return dev
         }
 
         throw ResolverError.missingPath("找不到 SwiftWhisper headless 執行檔")
     }
+
+    // MARK: - Models
 
     static func swiftWhisperModelDirectory() throws -> URL {
         let directory = try appSupportDirectory().appendingPathComponent("swiftwhisper-models", isDirectory: true)
@@ -179,19 +234,38 @@ enum PathResolver {
             return bundled
         }
 
-        let dev = repoRoot()
-            .appendingPathComponent("desktop-appkit/vendor/SwiftWhisper/whisper.cpp/models/\(packageName)", isDirectory: true)
-        if fileManager.fileExists(atPath: dev.path) {
+        if let dev = devRepoRoot()?
+            .appendingPathComponent("desktop-appkit/vendor/SwiftWhisper/whisper.cpp/models/\(packageName)", isDirectory: true),
+           fileManager.fileExists(atPath: dev.path) {
             return dev
         }
 
         return nil
     }
 
+    static func swiftWhisperCoreMLCompiledModel(named modelcName: String) -> URL? {
+        let fileManager = FileManager.default
+
+        if let bundled = Bundle.main.resourceURL?
+            .appendingPathComponent("swiftwhisper-models/\(modelcName)", isDirectory: true),
+           fileManager.fileExists(atPath: bundled.path) {
+            return bundled
+        }
+
+        if let dev = devRepoRoot()?
+            .appendingPathComponent("desktop-appkit/vendor/SwiftWhisper/whisper.cpp/models/\(modelcName)", isDirectory: true),
+           fileManager.fileExists(atPath: dev.path) {
+            return dev
+        }
+
+        return nil
+    }
+
+    // MARK: - Optional Tools
+
     static func ffmpegBinary() -> URL? {
         let candidates = [
-            Bundle.main.resourceURL?.appendingPathComponent("desktop/runtime/bin/ffmpeg"),
-            Bundle.main.resourceURL?.appendingPathComponent("desktop/runtime/python/bin/ffmpeg"),
+            Bundle.main.resourceURL?.appendingPathComponent("bin/ffmpeg"),
             URL(fileURLWithPath: "/opt/homebrew/bin/ffmpeg"),
             URL(fileURLWithPath: "/usr/local/bin/ffmpeg"),
         ].compactMap { $0 }
@@ -199,22 +273,16 @@ enum PathResolver {
         return candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) })
     }
 
+    // MARK: - Environment
+
     static func backendEnvironment() throws -> [String: String] {
         let python = try pythonExecutable()
         var env = ProcessInfo.processInfo.environment
 
         var pathEntries: [String] = []
         pathEntries.append(python.deletingLastPathComponent().path)
-        if let ffmpeg = ffmpegBinary()?.deletingLastPathComponent().path {
-            pathEntries.append(ffmpeg)
-        }
         pathEntries.append(env["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         env["PATH"] = pathEntries.joined(separator: ":")
-
-        if let ffmpeg = ffmpegBinary() {
-            env["FFMPEG_BINARY"] = ffmpeg.path
-            env["IMAGEIO_FFMPEG_EXE"] = ffmpeg.path
-        }
 
         if let resourceURL = Bundle.main.resourceURL {
             let pythonHome = resourceURL.appendingPathComponent("desktop/runtime/python", isDirectory: true)

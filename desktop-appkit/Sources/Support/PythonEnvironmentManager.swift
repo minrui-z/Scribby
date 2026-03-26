@@ -1,0 +1,405 @@
+import Foundation
+
+enum PythonDependencyGroup: String, CaseIterable {
+    case enhancement
+    case diarization
+
+    var packages: [String] {
+        switch self {
+        case .enhancement:
+            return ["mlx", "mlx-audio", "huggingface_hub"]
+        case .diarization:
+            return ["torch", "pyannote.audio", "pandas", "huggingface_hub"]
+        }
+    }
+
+    var testImport: String {
+        switch self {
+        case .enhancement: return "mlx_audio"
+        case .diarization: return "pyannote.audio"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .enhancement: return "人聲加強"
+        case .diarization: return "語者辨識"
+        }
+    }
+}
+
+/// Progress info for a pip package download.
+struct PipDownloadInfo: Sendable {
+    var packageName: String
+    var downloadedBytes: Int64
+    var totalBytes: Int64
+    var status: String  // e.g. "Downloading", "Installing", "Collecting"
+}
+
+actor PythonEnvironmentManager {
+    static let shared = PythonEnvironmentManager()
+
+    private var readyGroups: Set<PythonDependencyGroup> = []
+
+    private var venvDirectory: URL {
+        get throws {
+            try PathResolver.appSupportDirectory()
+                .appendingPathComponent("python-env", isDirectory: true)
+        }
+    }
+
+    private var venvPython: URL {
+        get throws {
+            try venvDirectory.appendingPathComponent("bin/python3", isDirectory: false)
+        }
+    }
+
+    func pythonExecutable() throws -> URL {
+        try venvPython
+    }
+
+    func ensureReady(
+        for group: PythonDependencyGroup,
+        log: @escaping @Sendable (String) -> Void,
+        pipProgress: @escaping @Sendable (PipDownloadInfo) -> Void = { _ in }
+    ) async throws {
+        if readyGroups.contains(group) { return }
+
+        let venvDir = try venvDirectory
+        let python = try venvPython
+
+        // 1. Create venv if it doesn't exist
+        if !FileManager.default.fileExists(atPath: python.path) {
+            log("正在建立 Python 虛擬環境...")
+            try await createVenv(at: venvDir, log: log)
+        }
+
+        // 2. Check if the required package is already installed
+        let testImport = group.testImport
+        if await checkImport(python: python, module: testImport) {
+            readyGroups.insert(group)
+            return
+        }
+
+        // 3. Install packages
+        log("正在安裝\(group.label)所需的 Python 套件...")
+        try await installPackages(group.packages, python: python, log: log, pipProgress: pipProgress)
+
+        // 4. Verify
+        guard await checkImport(python: python, module: testImport) else {
+            throw ResolverError.missingPath("安裝 \(group.label) 依賴後仍無法 import \(testImport)")
+        }
+
+        readyGroups.insert(group)
+        log("\(group.label)環境就緒")
+    }
+
+    // MARK: - Private
+
+    private func createVenv(at directory: URL, log: @escaping @Sendable (String) -> Void) async throws {
+        let basePython = try await findSystemPython(log: log)
+
+        let process = Process()
+        process.executableURL = basePython
+        process.arguments = ["-m", "venv", directory.path]
+
+        let stderr = Pipe()
+        process.standardError = stderr
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            let errText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw ResolverError.missingPath("建立 Python venv 失敗：\(errText)")
+        }
+
+        log("正在升級 pip...")
+        let pip = Process()
+        pip.executableURL = directory.appendingPathComponent("bin/python3")
+        pip.arguments = ["-m", "pip", "install", "--upgrade", "pip"]
+        pip.standardOutput = FileHandle.nullDevice
+        pip.standardError = FileHandle.nullDevice
+        try pip.run()
+        pip.waitUntilExit()
+    }
+
+    private func findSystemPython(log: @escaping @Sendable (String) -> Void) async throws -> URL {
+        if let found = locateExistingPython() {
+            return found
+        }
+
+        // No Python found — install via Xcode Command Line Tools
+        log("正在安裝環境...")
+        try await installCommandLineTools(log: log)
+
+        // After installation, check again
+        if let found = locateExistingPython() {
+            return found
+        }
+
+        throw ResolverError.missingPath("環境安裝未完成，請完成系統彈出的安裝視窗後重試")
+    }
+
+    private func locateExistingPython() -> URL? {
+        let candidates = [
+            "/opt/homebrew/bin/python3",
+            "/opt/homebrew/bin/python3.12",
+            "/opt/homebrew/bin/python3.11",
+            "/usr/local/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
+            "/usr/bin/python3",
+        ]
+        for path in candidates {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                // /usr/bin/python3 is a shim — verify it actually works
+                if path == "/usr/bin/python3" {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: path)
+                    process.arguments = ["--version"]
+                    process.standardOutput = FileHandle.nullDevice
+                    process.standardError = FileHandle.nullDevice
+                    do {
+                        try process.run()
+                        process.waitUntilExit()
+                        if process.terminationStatus != 0 { continue }
+                    } catch {
+                        continue
+                    }
+                }
+                return URL(fileURLWithPath: path)
+            }
+        }
+        return nil
+    }
+
+    private func installCommandLineTools(log: @escaping @Sendable (String) -> Void) async throws {
+        // Trigger the macOS install dialog
+        let trigger = Process()
+        trigger.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+        trigger.arguments = ["--install"]
+        trigger.standardOutput = FileHandle.nullDevice
+        trigger.standardError = FileHandle.nullDevice
+        try trigger.run()
+        trigger.waitUntilExit()
+
+        log("正在安裝環境，請稍候...")
+
+        // Poll until python3 becomes available (or timeout after 10 minutes)
+        let deadline = Date().addingTimeInterval(600)
+        while Date() < deadline {
+            try await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds
+
+            // Check if CLT installation finished
+            let check = Process()
+            check.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
+            check.arguments = ["-p"]
+            check.standardOutput = FileHandle.nullDevice
+            check.standardError = FileHandle.nullDevice
+            do {
+                try check.run()
+                check.waitUntilExit()
+                if check.terminationStatus == 0 {
+                    // CLT installed, verify python3
+                    if locateExistingPython() != nil {
+                        log("環境安裝完成")
+                        return
+                    }
+                }
+            } catch {
+                continue
+            }
+        }
+
+        throw ResolverError.missingPath("環境安裝逾時，請完成系統彈出的安裝視窗後重試")
+    }
+
+    private func checkImport(python: URL, module: String) async -> Bool {
+        let process = Process()
+        process.executableURL = python
+        process.arguments = ["-c", "import \(module)"]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func installPackages(
+        _ packages: [String],
+        python: URL,
+        log: @escaping @Sendable (String) -> Void,
+        pipProgress: @escaping @Sendable (PipDownloadInfo) -> Void
+    ) async throws {
+        let process = Process()
+        process.executableURL = python
+        process.arguments = ["-m", "pip", "install", "--progress-bar=on"] + packages
+
+        let stderr = Pipe()
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        // Track current downloading package
+        let state = PipParserState()
+
+        let stderrHandle = stderr.fileHandleForReading
+        stderrHandle.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let text = String(decoding: data, as: UTF8.self)
+            for line in text.split(whereSeparator: \.isNewline) {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                // pip writes download progress to stderr
+                if let info = Self.parsePipLine(trimmed, state: state) {
+                    pipProgress(info)
+                }
+                log(trimmed)
+            }
+        }
+
+        let stdoutHandle = stdout.fileHandleForReading
+        stdoutHandle.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let text = String(decoding: data, as: UTF8.self)
+            for line in text.split(whereSeparator: \.isNewline) {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                if let info = Self.parsePipLine(trimmed, state: state) {
+                    pipProgress(info)
+                }
+                if trimmed.hasPrefix("Collecting") || trimmed.hasPrefix("Downloading") ||
+                   trimmed.hasPrefix("Installing") || trimmed.hasPrefix("Successfully") {
+                    log(trimmed)
+                }
+            }
+        }
+
+        try process.run()
+        process.waitUntilExit()
+        stderrHandle.readabilityHandler = nil
+        stdoutHandle.readabilityHandler = nil
+
+        guard process.terminationStatus == 0 else {
+            let errText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            throw ResolverError.missingPath("pip install 失敗：\(errText)")
+        }
+    }
+
+    // MARK: - Pip Output Parsing
+
+    /// Parse pip output lines to extract download progress.
+    /// pip outputs lines like:
+    ///   "Collecting torch"
+    ///   "Downloading torch-2.3.0-...-macosx_14_0_arm64.whl (62.4 MB)"
+    ///   "   ━━━━━━━━━╸━━━━━━━━━━━   45.2/62.4 MB  12.3 MB/s  eta 0:00:01"
+    ///   "Installing collected packages: torch, ..."
+    ///   "Successfully installed torch-2.3.0 ..."
+    private static func parsePipLine(_ line: String, state: PipParserState) -> PipDownloadInfo? {
+        // "Collecting <package>"
+        if line.hasPrefix("Collecting ") {
+            let pkg = String(line.dropFirst("Collecting ".count).prefix(while: { !$0.isWhitespace }))
+            state.currentPackage = pkg
+            return PipDownloadInfo(packageName: pkg, downloadedBytes: 0, totalBytes: 0, status: "Collecting")
+        }
+
+        // "Downloading <filename> (<size>)"
+        // e.g. "Downloading torch-2.3.0-cp312-cp312-macosx_14_0_arm64.whl (62.4 MB)"
+        if line.hasPrefix("Downloading ") {
+            let rest = String(line.dropFirst("Downloading ".count))
+            let pkg = state.currentPackage ?? String(rest.prefix(while: { !$0.isWhitespace && $0 != "-" }))
+            state.currentPackage = pkg
+
+            // Extract total size from parentheses
+            if let parenStart = rest.lastIndex(of: "("),
+               let parenEnd = rest.lastIndex(of: ")") {
+                let sizeStr = String(rest[rest.index(after: parenStart)..<parenEnd])
+                let totalBytes = Self.parseSize(sizeStr)
+                state.currentTotalBytes = totalBytes
+                return PipDownloadInfo(packageName: pkg, downloadedBytes: 0, totalBytes: totalBytes, status: "Downloading")
+            }
+            return PipDownloadInfo(packageName: pkg, downloadedBytes: 0, totalBytes: 0, status: "Downloading")
+        }
+
+        // Progress bar line: "   ━━━━━━━━━╸━━━━━━━━━━━   45.2/62.4 MB  12.3 MB/s  eta 0:00:01"
+        // Or: "   ━━━━━━━━━━━━━━━━━━━━━━  62.4/62.4 MB  15.0 MB/s  eta 0:00:00"
+        if line.contains("━") || line.contains("╸") || line.contains("╺") {
+            if let pkg = state.currentPackage {
+                // Try to parse "X.X/Y.Y MB" pattern
+                if let (downloaded, total) = Self.parseProgressFraction(line) {
+                    state.currentTotalBytes = total
+                    return PipDownloadInfo(packageName: pkg, downloadedBytes: downloaded, totalBytes: total, status: "Downloading")
+                }
+            }
+            return nil
+        }
+
+        // "Installing collected packages: ..."
+        if line.hasPrefix("Installing collected packages:") {
+            state.currentPackage = nil
+            state.currentTotalBytes = 0
+            return PipDownloadInfo(packageName: "安裝中", downloadedBytes: 0, totalBytes: 0, status: "Installing")
+        }
+
+        // "Successfully installed ..."
+        if line.hasPrefix("Successfully installed") {
+            return PipDownloadInfo(packageName: "完成", downloadedBytes: 1, totalBytes: 1, status: "Done")
+        }
+
+        return nil
+    }
+
+    /// Parse size string like "62.4 MB", "1.2 GB", "450 kB" into bytes.
+    private static func parseSize(_ str: String) -> Int64 {
+        let parts = str.trimmingCharacters(in: .whitespaces).split(separator: " ")
+        guard parts.count == 2, let value = Double(parts[0]) else { return 0 }
+        let unit = parts[1].uppercased()
+        switch unit {
+        case "KB": return Int64(value * 1_000)
+        case "MB": return Int64(value * 1_000_000)
+        case "GB": return Int64(value * 1_000_000_000)
+        default: return Int64(value)
+        }
+    }
+
+    /// Parse "45.2/62.4 MB" from a progress bar line.
+    private static func parseProgressFraction(_ line: String) -> (downloaded: Int64, total: Int64)? {
+        // Look for pattern like "45.2/62.4 MB" or "1.2/3.5 GB"
+        let pattern = #"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s*(kB|MB|GB)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)),
+              match.numberOfRanges >= 4 else { return nil }
+
+        let downloadedStr = String(line[Range(match.range(at: 1), in: line)!])
+        let totalStr = String(line[Range(match.range(at: 2), in: line)!])
+        let unit = String(line[Range(match.range(at: 3), in: line)!])
+
+        guard let downloadedVal = Double(downloadedStr),
+              let totalVal = Double(totalStr) else { return nil }
+
+        let multiplier: Double
+        switch unit.uppercased() {
+        case "KB": multiplier = 1_000
+        case "MB": multiplier = 1_000_000
+        case "GB": multiplier = 1_000_000_000
+        default: multiplier = 1
+        }
+
+        return (Int64(downloadedVal * multiplier), Int64(totalVal * multiplier))
+    }
+}
+
+/// Mutable state for tracking pip's current download across lines.
+private final class PipParserState: @unchecked Sendable {
+    var currentPackage: String?
+    var currentTotalBytes: Int64 = 0
+}

@@ -59,7 +59,7 @@ def verify_token(token: str) -> None:
     sys.stdout.write("\n")
 
 
-def diarize(audio_path: str, token: str, segments_path: str, speakers: int | None = None) -> None:
+def diarize(audio_path: str, token: str, segments_path: str, speakers: int | None = None, is_wav: bool = False) -> None:
     import pandas as pd
     import torch
     from pyannote.audio import Pipeline
@@ -89,28 +89,36 @@ def diarize(audio_path: str, token: str, segments_path: str, speakers: int | Non
         kwargs["num_speakers"] = int(speakers)
 
     try:
-        ffmpeg_bin = (
-            os.environ.get("FFMPEG_BINARY")
-            or os.environ.get("IMAGEIO_FFMPEG_EXE")
-            or "ffmpeg"
-        )
         _log(f"語者辨識準備開始，目標裝置={device}")
-        _log(f"正在用 {ffmpeg_bin} 透過 pipe 轉成 WAV 並直接載入記憶體...")
-        ffmpeg = subprocess.run(
-            [
-                ffmpeg_bin,
-                "-v",
-                "error",
-                "-i", audio_path,
-                "-vn",
-                "-f", "wav",
-                "-acodec", "pcm_s16le",
-                "pipe:1",
-            ],
-            check=True,
-            capture_output=True,
-        )
-        waveform, sample_rate = _load_waveform_from_wav_bytes(ffmpeg.stdout)
+        if is_wav:
+            # WAV already pre-converted by Swift (AVFoundation), read directly
+            _log("正在直接讀取 WAV 檔案...")
+            with open(audio_path, "rb") as f:
+                wav_bytes = f.read()
+            waveform, sample_rate = _load_waveform_from_wav_bytes(wav_bytes)
+        else:
+            # Fallback: use ffmpeg to convert
+            ffmpeg_bin = (
+                os.environ.get("FFMPEG_BINARY")
+                or os.environ.get("IMAGEIO_FFMPEG_EXE")
+                or "ffmpeg"
+            )
+            _log(f"正在用 {ffmpeg_bin} 透過 pipe 轉成 WAV 並直接載入記憶體...")
+            ffmpeg = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-v",
+                    "error",
+                    "-i", audio_path,
+                    "-vn",
+                    "-f", "wav",
+                    "-acodec", "pcm_s16le",
+                    "pipe:1",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            waveform, sample_rate = _load_waveform_from_wav_bytes(ffmpeg.stdout)
         _log(f"音訊已載入：channels={waveform.shape[0]}, sample_rate={sample_rate}, frames={waveform.shape[1]}")
 
         _log("正在建立 pyannote pipeline...")
@@ -228,9 +236,12 @@ def main() -> None:
 
     if command == "diarize":
         if len(sys.argv) < 5:
-            _error("用法：pyannote_diarize.py diarize <audio> <token> <segments.json> [speakers]")
-        speakers = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].strip() else None
-        diarize(sys.argv[2], sys.argv[3], sys.argv[4], speakers)
+            _error("用法：pyannote_diarize.py diarize <audio> <token> <segments.json> [--wav] [speakers]")
+        remaining = sys.argv[5:]
+        is_wav = "--wav" in remaining
+        remaining = [a for a in remaining if a != "--wav"]
+        speakers = int(remaining[0]) if remaining and remaining[0].strip() else None
+        diarize(sys.argv[2], sys.argv[3], sys.argv[4], speakers, is_wav=is_wav)
         return
 
     _error(f"未知命令：{command}")

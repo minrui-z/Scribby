@@ -248,6 +248,10 @@ extension ProviderEvent: CustomStringConvertible {
             return "taskFailed(\(message))"
         case .taskStopped(_, let message):
             return "taskStopped(\(message))"
+        case .taskPhaseChanged(_, let phase, _):
+            return "taskPhaseChanged(\(phase.rawValue))"
+        case .taskDownloadProgress(_, let info):
+            return "taskDownloadProgress(\(info.filename): \(info.fractionCompleted))"
         case .backendError(let message):
             return "backendError(\(message))"
         }
