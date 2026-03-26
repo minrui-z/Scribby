@@ -7,6 +7,7 @@ enum AudioDecodingError: LocalizedError {
     case readFailed
     case ffmpegUnavailable
     case ffmpegFailed(String)
+    case unsupportedWaveEncoding(String)
 
     var errorDescription: String? {
         switch self {
@@ -20,6 +21,8 @@ enum AudioDecodingError: LocalizedError {
             return "找不到可用的 ffmpeg，無法做音訊轉換"
         case .ffmpegFailed(let message):
             return "ffmpeg 音訊轉換失敗：\(message)"
+        case .unsupportedWaveEncoding(let message):
+            return "WAV 音訊格式不支援：\(message)"
         }
     }
 }
@@ -27,6 +30,15 @@ enum AudioDecodingError: LocalizedError {
 struct DecodedAudio {
     let monoFrames: [Float]
     let stereoChannels: [[Float]]?
+}
+
+private struct ParsedWaveAudio {
+    let sampleRate: Int
+    let channelFrames: [[Float]]
+    let bitsPerSample: Int
+
+    var channelCount: Int { channelFrames.count }
+    var frameCount: Int { channelFrames.first?.count ?? 0 }
 }
 
 enum AudioDecoder {
@@ -40,7 +52,7 @@ enum AudioDecoder {
             // parse it directly without AVFoundation or ffmpeg.
             if url.pathExtension.lowercased() == "wav" {
                 do {
-                    let decoded = try decodePCM16Wave(url)
+                    let decoded = try decodePCMWave(url, diarize: diarize)
                     Diagnostics.log("swiftwhisper: direct WAV parse succeeded")
                     return decoded
                 } catch {
@@ -188,10 +200,23 @@ enum AudioDecoder {
         }
 
         defer { try? FileManager.default.removeItem(at: tempURL) }
-        return try decodePCM16Wave(tempURL)
+        return try decodePCMWave(tempURL, diarize: diarize)
     }
 
-    private static func decodePCM16Wave(_ url: URL) throws -> DecodedAudio {
+    private static func decodePCMWave(_ url: URL, diarize: Bool) throws -> DecodedAudio {
+        let parsed = try parseWaveFile(url)
+        Diagnostics.log(
+            "swiftwhisper: direct WAV metadata sampleRate=\(parsed.sampleRate) channels=\(parsed.channelCount) bitsPerSample=\(parsed.bitsPerSample) frames=\(parsed.frameCount)"
+        )
+        let decoded = normalizeWaveAudio(parsed, diarize: diarize)
+        let stereoInfo = decoded.stereoChannels.map { " stereoChannels=\($0.count)x\($0.first?.count ?? 0)" } ?? ""
+        Diagnostics.log(
+            "swiftwhisper: normalized WAV targetSampleRate=16000 monoFrames=\(decoded.monoFrames.count)\(stereoInfo)"
+        )
+        return decoded
+    }
+
+    private static func parseWaveFile(_ url: URL) throws -> ParsedWaveAudio {
         let data = try Data(contentsOf: url)
         guard data.count >= 44 else {
             throw AudioDecodingError.readFailed
@@ -211,7 +236,9 @@ enum AudioDecoder {
         }
 
         var offset = 12
+        var audioFormat: Int?
         var channelCount: Int?
+        var sampleRate: Int?
         var bitsPerSample: Int?
         var dataOffset: Int?
         var dataSize: Int?
@@ -226,8 +253,15 @@ enum AudioDecoder {
 
             if chunkID == "fmt " {
                 if chunkSize >= 16 {
+                    audioFormat = Int(littleEndianUInt16(at: chunkDataStart))
                     channelCount = Int(littleEndianUInt16(at: chunkDataStart + 2))
+                    sampleRate = Int(littleEndianUInt32(at: chunkDataStart + 4))
                     bitsPerSample = Int(littleEndianUInt16(at: chunkDataStart + 14))
+                    if audioFormat == 0xFFFE, chunkSize >= 40 {
+                        // WAVE_FORMAT_EXTENSIBLE: the first 16 bits of the subformat
+                        // identify PCM (1) / IEEE float (3).
+                        audioFormat = Int(littleEndianUInt16(at: chunkDataStart + 24))
+                    }
                 }
             } else if chunkID == "data" {
                 dataOffset = chunkDataStart
@@ -238,52 +272,150 @@ enum AudioDecoder {
         }
 
         guard
+            let audioFormat,
             let channelCount,
+            let sampleRate,
             let bitsPerSample,
             let dataOffset,
             let dataSize,
-            bitsPerSample == 16,
-            channelCount == 1 || channelCount == 2
+            sampleRate > 0,
+            channelCount > 0
         else {
             throw AudioDecodingError.readFailed
         }
 
         let pcmData = data[dataOffset..<min(dataOffset + dataSize, data.count)]
-        let sampleCount = pcmData.count / 2 / channelCount
+        let bytesPerSample = bitsPerSample / 8
+        guard bytesPerSample > 0 else {
+            throw AudioDecodingError.readFailed
+        }
+
+        let frameStride = channelCount * bytesPerSample
+        let sampleCount = pcmData.count / frameStride
         guard sampleCount > 0 else {
             throw AudioDecodingError.readFailed
         }
 
-        var monoFrames: [Float] = []
-        monoFrames.reserveCapacity(sampleCount)
-        var leftFrames: [Float] = []
-        var rightFrames: [Float] = []
-
-        if channelCount == 2 {
-            leftFrames.reserveCapacity(sampleCount)
-            rightFrames.reserveCapacity(sampleCount)
+        var channelFrames = Array(repeating: [Float](), count: channelCount)
+        for index in 0..<channelCount {
+            channelFrames[index].reserveCapacity(sampleCount)
         }
 
-        pcmData.withUnsafeBytes { rawBuffer in
-            guard let samples = rawBuffer.bindMemory(to: Int16.self).baseAddress else { return }
-            for index in 0..<sampleCount {
-                if channelCount == 1 {
-                    let value = max(-1.0, min(Float(Int16(littleEndian: samples[index])) / 32767.0, 1.0))
-                    monoFrames.append(value)
-                } else {
-                    let left = max(-1.0, min(Float(Int16(littleEndian: samples[index * 2])) / 32767.0, 1.0))
-                    let right = max(-1.0, min(Float(Int16(littleEndian: samples[index * 2 + 1])) / 32767.0, 1.0))
-                    leftFrames.append(left)
-                    rightFrames.append(right)
-                    monoFrames.append((left + right) * 0.5)
+        func readInt16(_ buffer: Data, at offset: Int) -> Int16 {
+            let start = buffer.startIndex + offset
+            let low = UInt16(buffer[start])
+            let high = UInt16(buffer[start + 1]) << 8
+            return Int16(bitPattern: low | high)
+        }
+
+        func readInt32(_ buffer: Data, at offset: Int) -> Int32 {
+            let start = buffer.startIndex + offset
+            let b0 = UInt32(buffer[start])
+            let b1 = UInt32(buffer[start + 1]) << 8
+            let b2 = UInt32(buffer[start + 2]) << 16
+            let b3 = UInt32(buffer[start + 3]) << 24
+            return Int32(bitPattern: b0 | b1 | b2 | b3)
+        }
+
+        func readFloat32(_ buffer: Data, at offset: Int) -> Float32 {
+            Float32(bitPattern: UInt32(bitPattern: readInt32(buffer, at: offset)))
+        }
+
+        for frameIndex in 0..<sampleCount {
+            let frameOffset = frameIndex * frameStride
+            for channelIndex in 0..<channelCount {
+                let sampleOffset = frameOffset + (channelIndex * bytesPerSample)
+                let value: Float
+
+                switch (audioFormat, bitsPerSample) {
+                case (1, 16):
+                    value = Float(readInt16(pcmData, at: sampleOffset)) / 32767.0
+                case (1, 32):
+                    value = Float(readInt32(pcmData, at: sampleOffset)) / 2147483647.0
+                case (3, 32):
+                    value = readFloat32(pcmData, at: sampleOffset)
+                default:
+                    throw AudioDecodingError.unsupportedWaveEncoding(
+                        "audioFormat=\(audioFormat), bitsPerSample=\(bitsPerSample), channels=\(channelCount), sampleRate=\(sampleRate)"
+                    )
                 }
+
+                channelFrames[channelIndex].append(max(-1.0, min(value, 1.0)))
             }
         }
 
+        return ParsedWaveAudio(
+            sampleRate: sampleRate,
+            channelFrames: channelFrames,
+            bitsPerSample: bitsPerSample
+        )
+    }
+
+    private static func normalizeWaveAudio(_ parsed: ParsedWaveAudio, diarize: Bool) -> DecodedAudio {
+        let normalizedChannels = parsed.channelFrames.map {
+            resample($0, from: parsed.sampleRate, to: 16_000)
+        }
+
+        let monoFrames = mixdownToMono(normalizedChannels)
+        let stereoChannels: [[Float]]? = {
+            guard diarize, normalizedChannels.count >= 2 else { return nil }
+            return [normalizedChannels[0], normalizedChannels[1]]
+        }()
+
         return DecodedAudio(
             monoFrames: monoFrames,
-            stereoChannels: channelCount == 2 ? [leftFrames, rightFrames] : nil
+            stereoChannels: stereoChannels
         )
+    }
+
+    private static func mixdownToMono(_ channels: [[Float]]) -> [Float] {
+        guard let frameCount = channels.map(\.count).min(), frameCount > 0 else {
+            return []
+        }
+        guard channels.count > 1 else {
+            return channels.first ?? []
+        }
+
+        var mono = [Float](repeating: 0, count: frameCount)
+        let divisor = Float(channels.count)
+        for frameIndex in 0..<frameCount {
+            var sum: Float = 0
+            for channel in channels {
+                sum += channel[frameIndex]
+            }
+            mono[frameIndex] = sum / divisor
+        }
+        return mono
+    }
+
+    private static func resample(_ samples: [Float], from sourceRate: Int, to targetRate: Int) -> [Float] {
+        guard !samples.isEmpty, sourceRate > 0, targetRate > 0 else {
+            return samples
+        }
+        guard sourceRate != targetRate else {
+            return samples
+        }
+
+        let outputCount = max(1, Int((Double(samples.count) * Double(targetRate) / Double(sourceRate)).rounded()))
+        guard outputCount > 1, samples.count > 1 else {
+            return [samples[0]]
+        }
+
+        let lastIndex = samples.count - 1
+        let ratio = Double(sourceRate) / Double(targetRate)
+        var output = [Float](repeating: 0, count: outputCount)
+
+        for outputIndex in 0..<outputCount {
+            let sourcePosition = min(Double(lastIndex), Double(outputIndex) * ratio)
+            let lowerIndex = Int(sourcePosition.rounded(.down))
+            let upperIndex = min(lowerIndex + 1, lastIndex)
+            let fraction = Float(sourcePosition - Double(lowerIndex))
+            let lowerSample = samples[lowerIndex]
+            let upperSample = samples[upperIndex]
+            output[outputIndex] = lowerSample + ((upperSample - lowerSample) * fraction)
+        }
+
+        return output
     }
 
     private static func resolveFFmpeg() throws -> URL {

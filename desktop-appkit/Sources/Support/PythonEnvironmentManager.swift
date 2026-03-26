@@ -7,16 +7,47 @@ enum PythonDependencyGroup: String, CaseIterable {
     var packages: [String] {
         switch self {
         case .enhancement:
-            return ["mlx", "mlx-audio", "soundfile", "huggingface_hub"]
+            return [
+                "mlx==0.31.1",
+                "mlx-audio==0.4.1",
+                "soundfile==0.13.1",
+                "huggingface_hub==1.8.0",
+            ]
         case .diarization:
             return ["torch", "pyannote.audio", "pandas", "huggingface_hub"]
         }
     }
 
-    var testImport: String {
+    /// Version check script: verifies the package can be imported AND the pinned
+    /// version matches.  Returns a Python one-liner suitable for `python -c`.
+    var versionCheckScript: String {
         switch self {
-        case .enhancement: return "mlx_audio"
-        case .diarization: return "pyannote.audio"
+        case .enhancement:
+            // Check that mlx_audio is importable and its version matches the pin.
+            return """
+            import mlx_audio; \
+            assert mlx_audio.__version__ == '0.4.1', \
+            f'want 0.4.1 got {mlx_audio.__version__}'
+            """
+        case .diarization:
+            return "import pyannote.audio"
+        }
+    }
+
+    /// Expected package versions keyed by pip package name.
+    /// Used for the environment manifest / fingerprint.
+    var expectedVersions: [String: String] {
+        switch self {
+        case .enhancement:
+            return [
+                "mlx": "0.31.1",
+                "mlx-audio": "0.4.1",
+                "soundfile": "0.13.1",
+                "huggingface_hub": "1.8.0",
+            ]
+        case .diarization:
+            // Diarization packages are not pinned to exact versions.
+            return [:]
         }
     }
 
@@ -36,6 +67,16 @@ struct PipDownloadInfo: Sendable {
     var status: String  // e.g. "Downloading", "Installing", "Collecting"
 }
 
+// MARK: - Environment Manifest
+
+/// Persisted alongside `python-env/` to detect version drift or corruption.
+private struct EnvironmentManifest: Codable {
+    var pythonVersion: String
+    var groups: [String: [String: String]]  // group.rawValue → { package: version }
+
+    static let fileName = "env-manifest.json"
+}
+
 actor PythonEnvironmentManager {
     static let shared = PythonEnvironmentManager()
 
@@ -51,6 +92,13 @@ actor PythonEnvironmentManager {
     private var venvPython: URL {
         get throws {
             try venvDirectory.appendingPathComponent("bin/python3", isDirectory: false)
+        }
+    }
+
+    private var manifestURL: URL {
+        get throws {
+            try PathResolver.appSupportDirectory()
+                .appendingPathComponent(EnvironmentManifest.fileName, isDirectory: false)
         }
     }
 
@@ -73,29 +121,55 @@ actor PythonEnvironmentManager {
 
         let venvDir = try venvDirectory
         let python = try venvPython
+        let manifest = readManifest()
 
-        // 1. Create venv if it doesn't exist
+        // 1. Check if venv exists
+        let venvExists = FileManager.default.fileExists(atPath: python.path)
+
+        // 2. If venv exists, check manifest for version drift
+        if venvExists, let manifest = manifest {
+            let drifted = isManifestDrifted(manifest, for: group, python: python)
+            if drifted {
+                log("偵測到環境版本不符，正在重建...")
+                try destroyVenv(at: venvDir)
+                readyGroups = []  // All groups invalidated
+            }
+        } else if venvExists, manifest == nil {
+            // Venv exists but no manifest — legacy env, rebuild to be safe
+            // only if this group has pinned versions worth checking
+            if !group.expectedVersions.isEmpty {
+                let versionOK = await checkCapability(python: python, group: group)
+                if !versionOK {
+                    log("舊環境缺少版本記錄且驗證失敗，正在重建...")
+                    try destroyVenv(at: venvDir)
+                    readyGroups = []
+                }
+            }
+        }
+
+        // 3. Create venv if needed
         if !FileManager.default.fileExists(atPath: python.path) {
             log("正在建立 Python 虛擬環境...")
             try await createVenv(at: venvDir, log: log)
         }
 
-        // 2. Check if the required package is already installed
-        let testImport = group.testImport
-        if await checkImport(python: python, module: testImport) {
+        // 4. Check capability (import + version)
+        if await checkCapability(python: python, group: group) {
+            try updateManifest(for: group, python: python)
             readyGroups.insert(group)
             return
         }
 
-        // 3. Install packages
+        // 5. Install packages
         log("正在安裝\(group.label)所需的 Python 套件...")
         try await installPackages(group.packages, python: python, log: log, pipProgress: pipProgress)
 
-        // 4. Verify
-        guard await checkImport(python: python, module: testImport) else {
-            throw ResolverError.missingPath("安裝 \(group.label) 依賴後仍無法 import \(testImport)")
+        // 6. Verify
+        guard await checkCapability(python: python, group: group) else {
+            throw ResolverError.missingPath("安裝 \(group.label) 依賴後仍無法通過能力驗證")
         }
 
+        try updateManifest(for: group, python: python)
         readyGroups.insert(group)
         log("\(group.label)環境就緒")
     }
@@ -244,10 +318,11 @@ actor PythonEnvironmentManager {
         throw ResolverError.missingPath("環境安裝逾時，請完成系統彈出的安裝視窗後重試")
     }
 
-    private func checkImport(python: URL, module: String) async -> Bool {
+    /// Check that the group's packages are importable AND at the expected version.
+    private func checkCapability(python: URL, group: PythonDependencyGroup) async -> Bool {
         let process = Process()
         process.executableURL = python
-        process.arguments = ["-c", "import \(module)"]
+        process.arguments = ["-c", group.versionCheckScript]
         process.environment = cleanEnvironment(python: python)
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -258,6 +333,94 @@ actor PythonEnvironmentManager {
             return process.terminationStatus == 0
         } catch {
             return false
+        }
+    }
+
+    // MARK: - Manifest
+
+    private func readManifest() -> EnvironmentManifest? {
+        guard let url = try? manifestURL,
+              let data = try? Data(contentsOf: url),
+              let manifest = try? JSONDecoder().decode(EnvironmentManifest.self, from: data) else {
+            return nil
+        }
+        return manifest
+    }
+
+    private func updateManifest(for group: PythonDependencyGroup, python: URL) throws {
+        let url = try manifestURL
+        var manifest = readManifest() ?? EnvironmentManifest(pythonVersion: "", groups: [:])
+
+        // Record Python version
+        manifest.pythonVersion = pythonVersion(python: python) ?? manifest.pythonVersion
+
+        // Record installed versions for this group
+        manifest.groups[group.rawValue] = group.expectedVersions
+
+        let data = try JSONEncoder().encode(manifest)
+        try data.write(to: url, options: .atomic)
+    }
+
+    private func isManifestDrifted(
+        _ manifest: EnvironmentManifest,
+        for group: PythonDependencyGroup,
+        python: URL
+    ) -> Bool {
+        // Check Python major.minor hasn't changed
+        if let currentPy = pythonVersion(python: python) {
+            let manifestMajorMinor = manifest.pythonVersion.components(separatedBy: ".").prefix(2).joined(separator: ".")
+            let currentMajorMinor = currentPy.components(separatedBy: ".").prefix(2).joined(separator: ".")
+            if !manifestMajorMinor.isEmpty, manifestMajorMinor != currentMajorMinor {
+                return true
+            }
+        }
+
+        // Check group package versions
+        let expected = group.expectedVersions
+        guard !expected.isEmpty else { return false }
+
+        guard let recorded = manifest.groups[group.rawValue] else {
+            return false  // Not recorded yet — not a drift, just first install
+        }
+
+        for (pkg, version) in expected {
+            if recorded[pkg] != version {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func destroyVenv(at directory: URL) throws {
+        if FileManager.default.fileExists(atPath: directory.path) {
+            try FileManager.default.removeItem(at: directory)
+        }
+        // Also remove the manifest
+        if let url = try? manifestURL,
+           FileManager.default.fileExists(atPath: url.path) {
+            try FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private func pythonVersion(python: URL) -> String? {
+        let process = Process()
+        process.executableURL = python
+        process.arguments = ["--version"]
+        process.environment = cleanEnvironment(python: python)
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            // "Python 3.12.3\n" → "3.12.3"
+            return output.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "Python ", with: "")
+        } catch {
+            return nil
         }
     }
 

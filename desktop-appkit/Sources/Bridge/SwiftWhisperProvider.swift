@@ -144,6 +144,8 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             onEvent?(.queueUpdated(snapshot))
 
             var enhancedTempURL: URL?
+
+
             do {
                 // Ensure Python environment is ready for required features
                 if request.enhance {
@@ -188,6 +190,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                         .appendingPathExtension("wav")
                     enhancedTempURL = tempURL
 
+                    // Python outputs 16kHz mono PCM WAV directly
                     try await Self.runSpeechEnhancement(
                         filePath: item.id,
                         outputPath: tempURL.path,
@@ -218,21 +221,9 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     onEvent?(.taskProgress(fileId: item.fileId, message: "正在使用 SwiftWhisper 轉寫...", progress: 15))
                     onEvent?(.queueUpdated(snapshot))
                 } else {
-                    // Try to pre-convert to 16kHz PCM WAV so the headless binary
-                    // can parse it directly without AVFoundation or ffmpeg.
-                    // If conversion fails, pass the original file — headless will
-                    // try its own AVFoundation + direct WAV + ffmpeg fallback chain.
-                    let wavURL = FileManager.default.temporaryDirectory
-                        .appendingPathComponent(UUID().uuidString)
-                        .appendingPathExtension("wav")
-                    do {
-                        try await Self.convertToWAV(inputPath: item.id, outputPath: wavURL.path)
-                        enhancedTempURL = wavURL  // reuse for cleanup
-                        audioPath = wavURL.path
-                    } catch {
-                        try? FileManager.default.removeItem(at: wavURL)
-                        audioPath = item.id
-                    }
+                    // Pass the original file directly — headless has its own
+                    // fallback chain: AVFoundation → direct WAV parse → ffmpeg.
+                    audioPath = item.id
                 }
 
                 let result = try await Self.runHeadless(
