@@ -5,12 +5,8 @@ macOS 原生語音轉文字工具，支援多語者辨識與人聲加強。
 ## 功能
 
 - **SwiftWhisper + Core ML** 轉寫，支援 Apple Neural Engine 加速
-- **pyannote 多語者辨識**（需 HuggingFace token）
+- **多語者辨識**（需 HuggingFace token）
 - **MossFormer2 人聲加強**（MLX 加速）
-- 分段彩色進度條，即時顯示各處理階段
-- 下載資訊卡片，顯示模型下載進度與速度
-- 首次使用自動安裝 Python 環境與依賴套件
-- CoreML encoder 自動從 HuggingFace 下載
 
 ## 安裝
 
