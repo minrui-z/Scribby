@@ -72,13 +72,21 @@ struct DownloadProgress: Equatable {
     }
 }
 
+enum QueueItemStatus: String, Equatable {
+    case pending
+    case processing
+    case done
+    case error
+    case stopped
+}
+
 struct QueueItemModel: Identifiable, Equatable {
     let id: String
     let fileId: String
     var sourcePath: String
     var filename: String
     var size: Int64
-    var status: String
+    var status: QueueItemStatus
     var progress: Int
     var message: String
     var error: String?

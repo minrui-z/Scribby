@@ -1,4 +1,4 @@
-# Scribby v0.4.0beta
+# Scribby v0.5.0-beta
 
 macOS 原生語音轉文字工具，支援多語者辨識與人聲加強。
 

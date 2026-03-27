@@ -47,6 +47,14 @@ public actor ModelStore {
             throw SwiftWhisperCoreError.modelDownloadFailed("下載檔案不存在")
         }
 
+        // Reject suspiciously small files (< 1MB is certainly not a valid model)
+        let fileSize = (try? fileManager.attributesOfItem(atPath: localURL.path)[.size] as? Int64) ?? 0
+        if fileSize < 1_000_000 {
+            try? fileManager.removeItem(at: localURL)
+            throw SwiftWhisperCoreError.modelDownloadFailed(
+                "下載的模型檔案太小（\(fileSize) bytes），可能已損壞")
+        }
+
         do {
             // Move to .downloading first, then rename — atomic guarantee
             try? fileManager.removeItem(at: partialDestination)
@@ -73,6 +81,7 @@ public actor ModelStore {
 private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     private let filename: String
     private let continuation: CheckedContinuation<URL, Error>
+    private let lock = NSLock()
     private var resumed = false
     private var lastLogTime: TimeInterval = 0
     private let throttleInterval: TimeInterval = 0.3
@@ -91,14 +100,32 @@ private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        guard !resumed else { return }
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
         resumed = true
+        lock.unlock()
 
         let tempCopy = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension(URL(fileURLWithPath: filename).pathExtension)
         do {
             try FileManager.default.moveItem(at: location, to: tempCopy)
+
+            // Verify downloaded size matches Content-Length
+            if let http = downloadTask.response as? HTTPURLResponse {
+                let expectedLength = http.expectedContentLength
+                if expectedLength > 0 {
+                    let actualSize = (try? FileManager.default.attributesOfItem(atPath: tempCopy.path)[.size] as? Int64) ?? 0
+                    if actualSize != expectedLength {
+                        try? FileManager.default.removeItem(at: tempCopy)
+                        continuation.resume(throwing: SwiftWhisperCoreError.modelDownloadFailed(
+                            "檔案大小不符：預期 \(expectedLength)，實際 \(actualSize)"))
+                        session.finishTasksAndInvalidate()
+                        return
+                    }
+                }
+            }
+
             Diagnostics.log("[DOWNLOAD] \(filename) done")
             continuation.resume(returning: tempCopy)
         } catch {
@@ -108,8 +135,10 @@ private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard !resumed else { return }
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
         resumed = true
+        lock.unlock()
 
         if let error {
             continuation.resume(throwing: SwiftWhisperCoreError.modelDownloadFailed(error.localizedDescription))

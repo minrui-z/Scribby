@@ -303,20 +303,7 @@ actor PythonEnvironmentManager {
     }
 
     private func locateExistingPython() -> URL? {
-        let candidates = [
-            "/opt/homebrew/bin/python3",
-            "/opt/homebrew/bin/python3.13",
-            "/opt/homebrew/bin/python3.12",
-            "/opt/homebrew/bin/python3.11",
-            "/opt/homebrew/bin/python3.10",
-            "/usr/local/bin/python3",
-            "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
-            "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
-            "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
-            "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
-            "/usr/bin/python3",
-        ]
-        for path in candidates {
+        for path in PathResolver.systemPythonCandidates {
             guard FileManager.default.isExecutableFile(atPath: path) else { continue }
 
             // Verify it runs and meets version requirement
@@ -708,6 +695,7 @@ private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     private let destination: URL
     private let log: @Sendable (String) -> Void
     private let continuation: CheckedContinuation<URL, Error>
+    private let lock = NSLock()
     private var resumed = false
     private var lastLogTime: TimeInterval = 0
 
@@ -748,8 +736,10 @@ private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        guard !resumed else { return }
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
         resumed = true
+        lock.unlock()
 
         do {
             try? FileManager.default.removeItem(at: destination)
@@ -762,8 +752,10 @@ private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard !resumed else { return }
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
         resumed = true
+        lock.unlock()
 
         if let error {
             continuation.resume(throwing: ResolverError.missingPath("Python 下載失敗：\(error.localizedDescription)"))

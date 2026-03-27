@@ -106,7 +106,8 @@ struct RootView: View {
             }
 
             if !model.isProcessing,
-               let action = quietActionStatus {
+               model.showActionStatus,
+               let action = model.visibleActionStatus {
                 Text(action)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(statusColor(model.actionStatusTone))
@@ -281,7 +282,7 @@ struct RootView: View {
             }
             .frame(maxWidth: compact ? 320 : 680)
 
-            if let visiblePickerStatus {
+            if model.showPickerStatus, let visiblePickerStatus = model.visiblePickerStatus {
                 Text(visiblePickerStatus)
                     .font(.system(size: compact ? 12 : 14, weight: .semibold))
                     .foregroundStyle(statusColor(model.pickerStatusTone))
@@ -432,7 +433,7 @@ struct RootView: View {
                 }
             }
 
-            if showDiagnostics && shouldShowDiagnostics {
+            if showDiagnostics && model.shouldShowDiagnostics {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         Text("診斷輸出")
@@ -643,6 +644,51 @@ struct RootView: View {
                 .animation(.easeInOut(duration: 0.22), value: model.diarizeEnabled)
 
                 VStack(alignment: .leading, spacing: 10) {
+                    Text("辨識語言")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(primaryInk)
+                    Text("選擇音訊的語言，或讓模型自動偵測。")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(secondaryInk)
+
+                    let languageOptions: [(code: String, label: String)] = [
+                        ("auto", "自動偵測"),
+                        ("zh", "中文"),
+                        ("en", "English"),
+                        ("ja", "日本語"),
+                        ("ko", "한국어"),
+                        ("es", "Español"),
+                        ("fr", "Français"),
+                        ("de", "Deutsch"),
+                    ]
+                    ForEach(languageOptions, id: \.code) { option in
+                        Button {
+                            model.selectedLanguage = option.code
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: model.selectedLanguage == option.code ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(model.selectedLanguage == option.code ? Color.accentColor : secondaryInk)
+                                Text(option.label)
+                                    .font(.system(size: 13, weight: model.selectedLanguage == option.code ? .bold : .medium))
+                                    .foregroundStyle(primaryInk)
+                                Spacer()
+                            }
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.isProcessing)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(18)
+                .background(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .fill(Color.white.opacity(0.32))
+                )
+
+                VStack(alignment: .leading, spacing: 10) {
                     Text("辨識模型")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(primaryInk)
@@ -742,32 +788,6 @@ struct RootView: View {
         case .success: return Color(red: 0.14, green: 0.53, blue: 0.24)
         case .error: return Color(red: 0.74, green: 0.20, blue: 0.16)
         }
-    }
-
-    private var quietActionStatus: String? {
-        guard !model.actionStatus.isEmpty else { return nil }
-        if model.actionStatusTone == .error {
-            return model.actionStatus
-        }
-        if model.actionStatus.contains("已刪除") || model.actionStatus.contains("已複製") || model.actionStatus.contains("已下載") || model.actionStatus.contains("已加入") {
-            return model.actionStatus
-        }
-        return nil
-    }
-
-    private var visiblePickerStatus: String? {
-        guard !model.pickerStatus.isEmpty else { return nil }
-        if model.pickerStatus == "桌面版已就緒" {
-            return nil
-        }
-        if model.pickerStatusTone == .error || model.pickerStatus.contains("已取消") {
-            return model.pickerStatus
-        }
-        return nil
-    }
-
-    private var shouldShowDiagnostics: Bool {
-        model.actionStatusTone == .error && !model.diagnosticLogLines.isEmpty
     }
 
     private var queueAnimationSignature: String {
@@ -970,7 +990,7 @@ private struct QueueRow: View {
                             .padding(.vertical, 7)
                             .background(Capsule().fill(statusColor.opacity(0.14)))
                             .foregroundStyle(statusColor)
-                            .padding(.trailing, item.status != "processing" ? 38 : 0)
+                            .padding(.trailing, item.status != .processing ? 38 : 0)
                     }
                 }
 
@@ -982,7 +1002,7 @@ private struct QueueRow: View {
                         .fixedSize(horizontal: false, vertical: !compact)
                 }
 
-                if item.status == "processing" {
+                if item.status == .processing {
                     SegmentedProgressBar(
                         progress: item.progress,
                         phase: item.phase,
@@ -1002,7 +1022,7 @@ private struct QueueRow: View {
                 .fill(Color.white.opacity(0.72))
         )
         .overlay(alignment: .topTrailing) {
-            if item.status != "processing" {
+            if item.status != .processing {
                 Button(action: onDelete) {
                     Image(systemName: "trash")
                         .font(.system(size: 12, weight: .semibold))
@@ -1017,21 +1037,20 @@ private struct QueueRow: View {
 
     private var statusLabel: String {
         switch item.status {
-        case "pending": return "等待中"
-        case "processing": return "轉譯中"
-        case "done": return "完成"
-        case "error": return item.error ?? "失敗"
-        case "stopped": return "已停止"
-        default: return item.status
+        case .pending: return "等待中"
+        case .processing: return "轉譯中"
+        case .done: return "完成"
+        case .error: return item.error ?? "失敗"
+        case .stopped: return "已停止"
         }
     }
 
     private var statusColor: Color {
         switch item.status {
-        case "done": return .green
-        case "error", "stopped": return .red
-        case "processing": return .orange
-        default: return .secondary
+        case .done: return .green
+        case .error, .stopped: return .red
+        case .processing: return .orange
+        case .pending: return .secondary
         }
     }
 
@@ -1047,7 +1066,7 @@ private struct QueueRow: View {
 
     private var detailText: String? {
         switch item.status {
-        case "processing":
+        case .processing:
             return item.message.isEmpty ? statusLabel : item.message
         default:
             return nil
@@ -1055,7 +1074,7 @@ private struct QueueRow: View {
     }
 
     private var showsLeadingStatus: Bool {
-        ["done", "error", "stopped"].contains(item.status)
+        [.done, .error, .stopped].contains(item.status)
     }
 
     private var showsStatusLine: Bool {
@@ -1388,18 +1407,19 @@ private struct ResultCard: View {
 
     private var statusText: String {
         switch item.status {
-        case "done": return "完成"
-        case "error": return "失敗"
-        case "stopped": return "已停止"
-        default: return item.status
+        case .done: return "完成"
+        case .error: return "失敗"
+        case .stopped: return "已停止"
+        case .pending: return "等待中"
+        case .processing: return "轉譯中"
         }
     }
 
     private var statusColor: Color {
         switch item.status {
-        case "done": return .green
-        case "error", "stopped": return .red
-        default: return .secondary
+        case .done: return .green
+        case .error, .stopped: return .red
+        case .pending, .processing: return .secondary
         }
     }
 

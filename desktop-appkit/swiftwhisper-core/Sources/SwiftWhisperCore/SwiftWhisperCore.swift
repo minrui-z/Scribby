@@ -67,7 +67,7 @@ public struct SwiftWhisperRequest: Sendable, Codable {
     public var languageCode: String
     public var diarize: Bool
 
-    public init(audioFileURL: URL, languageCode: String = "zh", diarize: Bool = false) {
+    public init(audioFileURL: URL, languageCode: String = "auto", diarize: Bool = false) {
         self.audioFileURL = audioFileURL
         self.languageCode = languageCode
         self.diarize = diarize
@@ -147,7 +147,7 @@ public enum SwiftWhisperCoreError: LocalizedError {
         case .missingAudioFile(let url):
             return "找不到音訊檔：\(url.path)"
         case .unsupportedLanguage(let code):
-            return "目前 headless SwiftWhisper 僅支援固定語言設定，無法使用：\(code)"
+            return "不支援的語言代碼：\(code)"
         case .failedToCreateTempDirectory:
             return "無法建立 SwiftWhisper 模型快取資料夾"
         case .modelDownloadFailed(let message):
@@ -191,7 +191,13 @@ public actor SwiftWhisperCore {
             throw SwiftWhisperCoreError.missingAudioFile(request.audioFileURL)
         }
 
-        guard request.languageCode == "zh" else {
+        let resolvedLanguage: WhisperLanguage
+        let code = request.languageCode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if code.isEmpty || code == "auto" {
+            resolvedLanguage = .auto
+        } else if let lang = WhisperLanguage(rawValue: code) {
+            resolvedLanguage = lang
+        } else {
             throw SwiftWhisperCoreError.unsupportedLanguage(request.languageCode)
         }
 
@@ -199,10 +205,10 @@ public actor SwiftWhisperCore {
         let modelURL = try await ensureModel()
         Diagnostics.log("swiftwhisper: model ready at \(modelURL.path)")
         let decodedAudio = try AudioDecoder.decodeAudio(from: request.audioFileURL, diarize: request.diarize)
-        Diagnostics.log("swiftwhisper: decoded \(decodedAudio.monoFrames.count) PCM frames")
+        Diagnostics.log("swiftwhisper: decoded \(decodedAudio.monoFrames.count) PCM frames, language=\(code)")
 
         let params = WhisperParams()
-        params.language = .chinese
+        params.language = resolvedLanguage
         params.print_progress = false
         params.print_realtime = false
         params.print_timestamps = false

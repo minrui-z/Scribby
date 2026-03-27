@@ -23,7 +23,7 @@ struct SwiftWhisperHeadlessCLI {
         guard arguments.count > 1 else {
             throw SwiftWhisperCoreError.invalidRequest("用法：scribby-swiftwhisper-headless <audio_file> [language] [--diarize]")
         }
-        let language = arguments.count > 2 ? arguments[2] : "zh"
+        let language = arguments.count > 2 ? arguments[2] : "auto"
         let diarize = arguments.dropFirst(3).contains("--diarize")
         return SwiftWhisperRequest(
             audioFileURL: URL(fileURLWithPath: arguments[1]),

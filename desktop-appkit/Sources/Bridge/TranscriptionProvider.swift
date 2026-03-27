@@ -8,7 +8,6 @@ protocol TranscriptionProvider: AnyObject {
     func shutdown()
 
     func getInfo() async throws -> ProviderInfo
-    func subscribeEvents() async throws
     func verifyToken(_ token: String) async throws -> TokenVerificationResult
     func enqueue(paths: [String]) async throws -> ProviderSnapshot
     func startTranscription(_ request: TranscriptionRequest) async throws -> ProviderSnapshot
@@ -17,5 +16,4 @@ protocol TranscriptionProvider: AnyObject {
     func clearQueue() async throws -> ProviderSnapshot
     func removeQueueItem(fileId: String) async throws -> ProviderSnapshot
     func saveResult(fileId: String, destinationPath: String) async throws
-    func saveAllResults(fileIds: [String], destinationPath: String) async throws
 }

@@ -99,6 +99,22 @@ enum PathResolver {
             .appendingPathComponent("python-env/bin/python3", isDirectory: false)
     }
 
+    /// Shared list of system Python candidate paths, ordered by preference.
+    /// Used by both PathResolver and PythonEnvironmentManager.
+    static let systemPythonCandidates = [
+        "/opt/homebrew/bin/python3",
+        "/opt/homebrew/bin/python3.13",
+        "/opt/homebrew/bin/python3.12",
+        "/opt/homebrew/bin/python3.11",
+        "/opt/homebrew/bin/python3.10",
+        "/usr/local/bin/python3",
+        "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
+        "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
+        "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
+        "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
+        "/usr/bin/python3",
+    ]
+
     static func pythonExecutable() throws -> URL {
         // 1. Managed venv (auto-created by PythonEnvironmentManager)
         if let managed = try? managedPythonVenv(),
@@ -122,20 +138,7 @@ enum PathResolver {
         }
 
         // 4. System Python
-        let systemFallbacks = [
-            "/opt/homebrew/bin/python3",
-            "/opt/homebrew/bin/python3.13",
-            "/opt/homebrew/bin/python3.12",
-            "/opt/homebrew/bin/python3.11",
-            "/opt/homebrew/bin/python3.10",
-            "/usr/local/bin/python3",
-            "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
-            "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
-            "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
-            "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
-            "/usr/bin/python3",
-        ]
-        for path in systemFallbacks {
+        for path in systemPythonCandidates {
             if FileManager.default.isExecutableFile(atPath: path) {
                 return URL(fileURLWithPath: path)
             }
