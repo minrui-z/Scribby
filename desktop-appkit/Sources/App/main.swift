@@ -6,6 +6,7 @@ final class NativeAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValida
     private let model = NativeAppModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        _ = DebugLogger.shared  // 建立 log 檔（早於任何其他初始化）
         NativeLogger.log("applicationDidFinishLaunching")
         NSApp.mainMenu = buildMainMenu()
         let controller = NativeWindowController(model: model)

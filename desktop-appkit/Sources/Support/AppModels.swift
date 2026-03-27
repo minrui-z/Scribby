@@ -28,13 +28,15 @@ enum ProcessingPhase: String, Equatable, CaseIterable {
     case enhancing
     case transcribing
     case diarizing
+    case proofreading
 
     var color: Color {
         switch self {
-        case .downloading: return Color(red: 0.23, green: 0.51, blue: 0.96)   // #3B82F6
-        case .enhancing:   return Color(red: 0.55, green: 0.36, blue: 0.96)   // #8B5CF6
-        case .transcribing: return Color(red: 0.96, green: 0.62, blue: 0.04)  // #F59E0B
-        case .diarizing:   return Color(red: 0.06, green: 0.73, blue: 0.51)   // #10B981
+        case .downloading:  return Color(red: 0.23, green: 0.51, blue: 0.96)   // #3B82F6
+        case .enhancing:    return Color(red: 0.55, green: 0.36, blue: 0.96)   // #8B5CF6
+        case .transcribing: return Color(red: 0.96, green: 0.62, blue: 0.04)   // #F59E0B
+        case .diarizing:    return Color(red: 0.06, green: 0.73, blue: 0.51)   // #10B981
+        case .proofreading: return Color(red: 0.12, green: 0.62, blue: 0.67)   // #1E9EAB
         }
     }
 
@@ -44,6 +46,32 @@ enum ProcessingPhase: String, Equatable, CaseIterable {
         case .enhancing:    return "人聲加強"
         case .transcribing: return "轉寫"
         case .diarizing:    return "語者辨識"
+        case .proofreading: return "AI 校稿"
+        }
+    }
+}
+
+enum ProofreadingMode: String, CaseIterable, Codable {
+    case off
+    case conservative
+    case standard
+    case readable
+
+    var displayName: String {
+        switch self {
+        case .off:          return "關閉"
+        case .conservative: return "保守校正"
+        case .standard:     return "一般校正"
+        case .readable:     return "可讀版整理"
+        }
+    }
+
+    var description: String {
+        switch self {
+        case .off:          return "不啟用校稿"
+        case .conservative: return "只修明顯的辨識錯字和缺失標點，不改文意"
+        case .standard:     return "修錯字、補標點、改語境不通順的地方"
+        case .readable:     return "清理口語冗詞、重複語句，讓文字更流暢"
         }
     }
 }
@@ -151,6 +179,7 @@ struct TranscriptionRequest: Equatable {
     var speakers: Int
     var token: String
     var enhance: Bool
+    var proofreadingMode: ProofreadingMode
 }
 
 enum ProviderEvent: Equatable {

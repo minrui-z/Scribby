@@ -4,6 +4,7 @@ import Foundation
 enum PythonDependencyGroup: String, CaseIterable {
     case enhancement
     case diarization
+    case proofreading
 
     var packages: [String] {
         switch self {
@@ -16,6 +17,11 @@ enum PythonDependencyGroup: String, CaseIterable {
             ]
         case .diarization:
             return ["torch", "pyannote.audio", "pandas", "huggingface_hub"]
+        case .proofreading:
+            return [
+                "mlx-lm==0.31.1",
+                "huggingface_hub==1.8.0",
+            ]
         }
     }
 
@@ -41,6 +47,13 @@ enum PythonDependencyGroup: String, CaseIterable {
             """
         case .diarization:
             return "import pyannote.audio"
+        case .proofreading:
+            return """
+            from importlib.metadata import version; \
+            import mlx_lm; \
+            assert version('mlx-lm') == '0.31.1', \
+            f"want mlx-lm 0.31.1 got {version('mlx-lm')}"
+            """
         }
     }
 
@@ -58,6 +71,11 @@ enum PythonDependencyGroup: String, CaseIterable {
         case .diarization:
             // Diarization packages are not pinned to exact versions.
             return [:]
+        case .proofreading:
+            return [
+                "mlx-lm": "0.31.1",
+                "huggingface_hub": "1.8.0",
+            ]
         }
     }
 
@@ -65,6 +83,7 @@ enum PythonDependencyGroup: String, CaseIterable {
         switch self {
         case .enhancement: return "人聲加強"
         case .diarization: return "語者辨識"
+        case .proofreading: return "AI 校稿"
         }
     }
 }

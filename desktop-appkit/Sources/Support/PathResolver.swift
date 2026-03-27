@@ -177,6 +177,20 @@ enum PathResolver {
         throw ResolverError.missingPath("找不到 speech enhancement helper")
     }
 
+    static func proofreadingHelperScript() throws -> URL {
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("python/proofread.py"),
+           FileManager.default.fileExists(atPath: bundled.path) {
+            return bundled
+        }
+
+        if let dev = devRepoRoot()?.appendingPathComponent("desktop-appkit/python/proofread.py", isDirectory: false),
+           FileManager.default.fileExists(atPath: dev.path) {
+            return dev
+        }
+
+        throw ResolverError.missingPath("找不到 proofreading helper")
+    }
+
     // MARK: - Binaries
 
     static func swiftWhisperExecutable() throws -> URL {

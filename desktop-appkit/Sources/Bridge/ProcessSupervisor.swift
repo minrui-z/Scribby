@@ -6,6 +6,7 @@ actor ProcessSupervisor {
         case enhancement
         case headless
         case diarization
+        case proofreading
     }
 
     private var pids: [Stage: Int32] = [:]

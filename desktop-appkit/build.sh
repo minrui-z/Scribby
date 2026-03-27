@@ -60,6 +60,7 @@ cp "$BUILD_DIR/ScribbyNative" "$BIN_DIR/"
 cp "$HEADLESS_BIN" "$RES_DIR/bin/"
 cp "$WORKSPACE/python/pyannote_diarize.py" "$RES_DIR/python/"
 cp "$WORKSPACE/python/speech_enhance.py" "$RES_DIR/python/"
+cp "$WORKSPACE/python/proofread.py" "$RES_DIR/python/"
 cp "$WORKSPACE/Resources/Info.plist" "$APP_DIR/Contents/"
 if [[ -f "$WORKSPACE/Resources/AppIcon.icns" ]]; then
   cp "$WORKSPACE/Resources/AppIcon.icns" "$RES_DIR/"

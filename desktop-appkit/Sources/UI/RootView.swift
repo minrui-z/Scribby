@@ -45,6 +45,12 @@ struct RootView: View {
                             )
                         )
                 }
+
+                if model.showModelManager {
+                    modelManagerOverlay
+                        .zIndex(4)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                }
             }
         }
         .fileImporter(
@@ -736,6 +742,64 @@ struct RootView: View {
                     .modifier(WindowDragBlocker(model: model))
                 }
 
+                settingsCard {
+                    Text("AI 校稿（beta）")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(primaryInk)
+                    Text("轉譯完成後用本地 AI 模型校正文字。首次使用會自動下載約 1.5 GB 模型，需要 Apple Silicon。")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(secondaryInk)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    ForEach(ProofreadingMode.allCases, id: \.rawValue) { mode in
+                        Button {
+                            model.proofreadingMode = mode
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: model.proofreadingMode == mode
+                                    ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(model.proofreadingMode == mode ? Color.accentColor : secondaryInk)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(mode.displayName)
+                                        .font(.system(size: 13, weight: model.proofreadingMode == mode ? .bold : .medium))
+                                        .foregroundStyle(primaryInk)
+                                    if mode != .off {
+                                        Text(mode.description)
+                                            .font(.system(size: 11, weight: .medium))
+                                            .foregroundStyle(secondaryInk)
+                                    }
+                                }
+                                Spacer()
+                            }
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.isProcessing)
+                    }
+                }
+
+                settingsCard(tinted: false) {
+                    Button {
+                        model.showModelManager = true
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "square.and.arrow.down")
+                                .font(.system(size: 15, weight: .medium))
+                            Text("管理模型")
+                                .font(.system(size: 14, weight: .semibold))
+                            Spacer()
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(secondaryInk)
+                        }
+                        .foregroundStyle(primaryInk)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+
                 }
                 }
             }
@@ -750,6 +814,29 @@ struct RootView: View {
             .shadow(color: Color(red: 0.28, green: 0.20, blue: 0.12).opacity(0.05), radius: 18, x: -4, y: 6)
         }
         .animation(.easeInOut(duration: 0.28), value: model.showSettings)
+        .animation(.easeInOut(duration: 0.22), value: model.showModelManager)
+    }
+
+    private var modelManagerOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.12)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        model.showModelManager = false
+                    }
+                }
+
+            ModelManagerSheet {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    model.showModelManager = false
+                }
+            }
+            .onTapGesture {
+                // Swallow taps so background dismissal only happens outside the panel.
+            }
+        }
     }
 
     private func settingsCard<Content: View>(
@@ -1126,6 +1213,7 @@ private struct SegmentedProgressBar: View {
             case .enhancing:    return (p, 0.10)
             case .transcribing: return (p, activePhases.contains(.diarizing) ? 0.55 : 0.80)
             case .diarizing:    return (p, 0.25)
+            case .proofreading: return (p, 0.15)
             }
         }
         let totalWeight = weights.reduce(0.0) { $0 + $1.1 }

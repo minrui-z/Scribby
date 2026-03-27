@@ -173,6 +173,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             if request.enhance { activePhases.append(.enhancing) }
             activePhases.append(.transcribing)
             if request.diarize { activePhases.append(.diarizing) }
+            if request.proofreadingMode != .off { activePhases.append(.proofreading) }
 
             let initialPhase: ProcessingPhase = request.enhance ? .enhancing : .transcribing
             let progressMessage = initialPhase.label + "..."
@@ -185,6 +186,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 activePhases: activePhases
             )
             syncInfo()
+            DebugLogger.shared.write("[task] started: \(item.filename) phases=\(activePhases.map(\.rawValue))")
             onEvent?(.taskStarted(fileId: item.fileId, filename: item.filename))
             onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: initialPhase, activePhases: activePhases))
             onEvent?(.taskProgress(fileId: item.fileId, message: progressMessage, progress: 5))
@@ -255,13 +257,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                             filePath: item.sourcePath,
                             outputPath: tempURL.path,
                             processSupervisor: processSupervisor,
-                            log: { [weak self] line in
-                                Task { @MainActor in
-                                    guard let self else { return }
-                                    self.onEvent?(.taskLog(fileId: item.fileId, message: line))
-                                    self.onEvent?(.taskProgress(fileId: item.fileId, message: line, progress: nil))
-                                }
-                            },
+                            log: { line in DebugLogger.shared.write("[enhance] \(line)") },
                             downloadProgress: { [weak self] filename, downloaded, total in
                                 Task { @MainActor in
                                     guard let self else { return }
@@ -328,13 +324,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                                 self.handleStreamEvent(streamEvent, itemIndex: index, fileId: item.fileId, chunkState: activeChunkState)
                             }
                         },
-                        log: { [weak self] line in
-                            Task { @MainActor in
-                                guard let self else { return }
-                                self.onEvent?(.taskLog(fileId: item.fileId, message: line))
-                                self.onEvent?(.taskProgress(fileId: item.fileId, message: line, progress: nil))
-                            }
-                        },
+                        log: { line in DebugLogger.shared.write("[whisper] \(line)") },
                         downloadProgress: { [weak self] filename, downloaded, total in
                             Task { @MainActor in
                                 guard let self else { return }
@@ -380,12 +370,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                         speakers: request.speakers,
                         segments: result.segments,
                         processSupervisor: processSupervisor,
-                        log: { [weak self] line in
-                            Task { @MainActor in
-                                guard let self else { return }
-                                self.onEvent?(.taskLog(fileId: item.fileId, message: line))
-                            }
-                        }
+                        log: { line in DebugLogger.shared.write("[diarize] \(line)") }
                     )
                     activeChunkState.diarizationCompleted = true
                     chunkStates[item.fileId] = activeChunkState
@@ -401,8 +386,48 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     finalResult = result
                 }
 
+                // AI 校稿（失敗時 fallback 到原始轉寫結果，不中斷流程）
+                let proofreadResult: HeadlessResult
+                if request.proofreadingMode != .off {
+                    do {
+                        try await PythonEnvironmentManager.shared.ensureReady(
+                            for: .proofreading,
+                            log: { line in DebugLogger.shared.write("[proofread-env] \(line)") },
+                            pipProgress: { [weak self] info in
+                                Task { @MainActor in
+                                    guard let self else { return }
+                                    self.handlePipProgress(info, fileId: item.fileId, itemIndex: index, activePhases: activePhases)
+                                }
+                            }
+                        )
+                        snapshot.items[index].downloadProgress = nil
+                        snapshot.items[index].phase = .proofreading
+                        snapshot.items[index].message = "正在 AI 校稿..."
+                        syncInfo()
+                        onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: .proofreading, activePhases: activePhases))
+                        onEvent?(.taskProgress(fileId: item.fileId, message: "正在 AI 校稿...", progress: 90))
+                        onEvent?(.queueUpdated(snapshot))
+
+                        DebugLogger.shared.write("[proofread] start mode=\(request.proofreadingMode.rawValue) segments=\(finalResult.segments.count) lang=\(finalResult.language)")
+                        proofreadResult = try await TranscriptionPipelineRunner.runProofreading(
+                            result: finalResult,
+                            mode: request.proofreadingMode,
+                            processSupervisor: processSupervisor,
+                            log: { line in DebugLogger.shared.write("[proofread] \(line)") }
+                        )
+                        DebugLogger.shared.write("[proofread] done segments=\(proofreadResult.segments.count)")
+                    } catch {
+                        let errMsg = "AI 校稿失敗，使用原始轉寫結果：\(error.localizedDescription)"
+                        DebugLogger.shared.write("[proofread] ERROR: \(errMsg)")
+                        onEvent?(.taskLog(fileId: item.fileId, message: errMsg))
+                        proofreadResult = finalResult
+                    }
+                } else {
+                    proofreadResult = finalResult
+                }
+
                 QueueStateReducer.applyResult(
-                    finalResult,
+                    proofreadResult,
                     to: index,
                     snapshot: &snapshot,
                     diarizeRequested: request.diarize,
@@ -410,6 +435,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 )
                 syncInfo()
                 if let result = snapshot.items[index].result {
+                    DebugLogger.shared.write("[task] completed: \(item.filename) segments=\(result.segments.count) lang=\(result.language ?? "-")")
                     onEvent?(.taskCompleted(fileId: item.fileId, filename: item.filename, result: result))
                 }
                 onEvent?(.queueUpdated(snapshot))
@@ -443,6 +469,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 } else if let action = pendingControlAction {
                     shouldBreakLoop = handleControlAction(action, at: index)
                 } else {
+                    DebugLogger.shared.write("[task] failed: \(item.filename) — \(error.localizedDescription)")
                     await cleanupChunkState(for: item.fileId)
                     QueueStateReducer.applyFailure(error, to: index, snapshot: &snapshot)
                     syncInfo()

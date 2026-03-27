@@ -37,6 +37,10 @@ final class NativeAppModel: ObservableObject {
     @Published var selectedModelPreset: WhisperModelPreset = .default {
         didSet { UserDefaults.standard.set(selectedModelPreset.rawValue, forKey: "selectedModelPreset") }
     }
+    @Published var showModelManager = false
+    @Published var proofreadingMode: ProofreadingMode = .off {
+        didSet { UserDefaults.standard.set(proofreadingMode.rawValue, forKey: "proofreadingMode") }
+    }
 
     private var provider: TranscriptionProvider
     private let dialogs: DialogService
@@ -287,7 +291,8 @@ final class NativeAppModel: ObservableObject {
                         diarize: diarizeEnabled,
                         speakers: speakers,
                         token: token.trimmingCharacters(in: .whitespacesAndNewlines),
-                        enhance: enhancementEnabled
+                        enhance: enhancementEnabled,
+                        proofreadingMode: proofreadingMode
                     )
                 )
                 applySnapshot(snapshot)
@@ -410,6 +415,10 @@ final class NativeAppModel: ObservableObject {
            let preset = WhisperModelPreset(rawValue: presetRaw),
            preset != selectedModelPreset {
             switchModel(to: preset)
+        }
+        if let modeRaw = defaults.string(forKey: "proofreadingMode"),
+           let mode = ProofreadingMode(rawValue: modeRaw) {
+            proofreadingMode = mode
         }
     }
 

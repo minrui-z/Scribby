@@ -97,10 +97,15 @@ enum TranscriptionPipelineRunner {
 
             let stdoutHandle = stdout.fileHandleForReading
             let streamCollector = StreamCollector()
+            let stdoutEOF = DispatchSemaphore(value: 0)
+            let stderrEOF = DispatchSemaphore(value: 0)
 
             stdoutHandle.readabilityHandler = { handle in
                 let data = handle.availableData
-                guard !data.isEmpty else { return }
+                guard !data.isEmpty else {
+                    stdoutEOF.signal()
+                    return
+                }
                 let lines = streamCollector.append(data)
 
                 let decoder = JSONDecoder()
@@ -121,7 +126,10 @@ enum TranscriptionPipelineRunner {
             let stderrHandle = stderr.fileHandleForReading
             stderrHandle.readabilityHandler = { handle in
                 let data = handle.availableData
-                guard !data.isEmpty else { return }
+                guard !data.isEmpty else {
+                    stderrEOF.signal()
+                    return
+                }
                 let text = String(decoding: data, as: UTF8.self)
                 collectedStderr.append(text)
                 for line in text.split(whereSeparator: \.isNewline) {
@@ -145,14 +153,21 @@ enum TranscriptionPipelineRunner {
             await processSupervisor.register(pid: process.processIdentifier, for: .headless)
             process.waitUntilExit()
             await processSupervisor.clear(.headless, matching: process.processIdentifier)
+
+            // Wait for EOF on both pipes — ensures all in-flight
+            // readabilityHandler callbacks have finished processing
+            // before we check completedResult.
+            stdoutEOF.wait()
+            stderrEOF.wait()
             stdoutHandle.readabilityHandler = nil
             stderrHandle.readabilityHandler = nil
 
-            let remainingStdout = stdout.fileHandleForReading.readDataToEndOfFile()
-            if !remainingStdout.isEmpty {
-                let lines = streamCollector.appendFinal(remainingStdout)
+            // Process any data remaining in the StreamCollector buffer
+            // (partial line without trailing newline)
+            let finalLines = streamCollector.drainBuffer()
+            if !finalLines.isEmpty {
                 let decoder = JSONDecoder()
-                for line in lines {
+                for line in finalLines {
                     guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                           let lineData = line.data(using: .utf8) else { continue }
                     if let envelope = try? decoder.decode(HeadlessStreamEnvelope.self, from: lineData),
@@ -176,8 +191,8 @@ enum TranscriptionPipelineRunner {
             }
 
             guard let completedResult = streamCollector.completedResult() else {
-                let stderrTail = collectedStderr.tail(maxLines: 8)
-                let stdoutTail = streamCollector.tail(maxLines: 8)
+                let stderrTail = collectedStderr.tail(maxLines: 20)
+                let stdoutTail = streamCollector.tail(maxLines: 20)
                 throw NSError(
                     domain: "SwiftWhisperProvider",
                     code: 2,
@@ -389,6 +404,202 @@ enum TranscriptionPipelineRunner {
                 throw error
             }
         }.value
+    }
+
+    static func runProofreading(
+        result: HeadlessResult,
+        mode: ProofreadingMode,
+        processSupervisor: ProcessSupervisor,
+        log: @escaping @Sendable (String) -> Void
+    ) async throws -> HeadlessResult {
+        guard mode != .off else { return result }
+
+        #if !arch(arm64)
+        throw NSError(
+            domain: "SwiftWhisperProvider",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "AI 校稿功能需要 Apple Silicon（M1 以上）"]
+        )
+        #endif
+
+        return try await Task.detached(priority: .userInitiated) {
+            let python = try PathResolver.pythonExecutable()
+            let helper = try PathResolver.proofreadingHelperScript()
+            let cacheDir = try await ModelCatalog.shared.llmModelCacheDirectory()
+            let proofreadingLanguage = resolvedProofreadingLanguage(for: result)
+            log("AI 校稿語言：\(proofreadingLanguage)（原始=\(result.language)）")
+
+            let payload = ProofreadingPayload(
+                segments: result.segments,
+                mode: mode.rawValue,
+                language: proofreadingLanguage
+            )
+            let inputData = try JSONEncoder().encode(payload)
+
+            let process = Process()
+            process.executableURL = python
+            process.arguments = [helper.path]
+
+            var env = try PathResolver.backendEnvironment()
+            env["SCRIBBY_MLX_MODEL_CACHE"] = cacheDir.path
+            process.environment = env
+
+            let stdin = Pipe()
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardInput = stdin
+            process.standardOutput = stdout
+            process.standardError = stderr
+
+            let collectedStderr = StderrCollector()
+            let stderrHandle = stderr.fileHandleForReading
+            stderrHandle.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty else { return }
+                let text = String(decoding: data, as: UTF8.self)
+                collectedStderr.append(text)
+                for line in text.split(whereSeparator: \.isNewline) {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty { log(trimmed) }
+                }
+            }
+
+            try process.run()
+            await processSupervisor.register(pid: process.processIdentifier, for: .proofreading)
+
+            stdin.fileHandleForWriting.write(inputData)
+            stdin.fileHandleForWriting.closeFile()
+
+            process.waitUntilExit()
+            await processSupervisor.clear(.proofreading, matching: process.processIdentifier)
+            stderrHandle.readabilityHandler = nil
+
+            let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
+
+            guard process.terminationStatus == 0 else {
+                let errText = collectedStderr.tail(maxLines: 20)
+                throw NSError(
+                    domain: "SwiftWhisperProvider",
+                    code: Int(process.terminationStatus),
+                    userInfo: [NSLocalizedDescriptionKey: errText.isEmpty
+                        ? "AI 校稿失敗（exit \(process.terminationStatus)）"
+                        : errText]
+                )
+            }
+
+            let proofreadResult = try JSONDecoder().decode(ProofreadingResult.self, from: stdoutData)
+
+            let correctedSegments = zip(result.segments, proofreadResult.segments).map { original, corrected in
+                HeadlessSegment(
+                    startTimeMs: original.startTimeMs,
+                    endTimeMs: original.endTimeMs,
+                    text: corrected.text,
+                    speakerLabel: original.speakerLabel
+                )
+            }
+            let correctedText = correctedSegments.map(\.text).joined(separator: "\n")
+
+            return HeadlessResult(
+                text: correctedText,
+                language: proofreadingLanguage,
+                count: result.count,
+                suggestedFilename: result.suggestedFilename,
+                segments: correctedSegments,
+                modelName: result.modelName
+            )
+        }.value
+    }
+
+    private static func resolvedProofreadingLanguage(for result: HeadlessResult) -> String {
+        let normalized = normalizeLanguageCode(result.language)
+        if normalized != "auto" {
+            return normalized
+        }
+        return inferLanguageCode(from: result.segments) ?? "auto"
+    }
+
+    private static func normalizeLanguageCode(_ code: String) -> String {
+        let normalized = code
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "_", with: "-")
+            .lowercased()
+
+        guard !normalized.isEmpty else { return "auto" }
+        if normalized == "auto" { return "auto" }
+
+        if normalized.hasPrefix("zh") { return "zh" }
+        if normalized.hasPrefix("ja") { return "ja" }
+        if normalized.hasPrefix("ko") { return "ko" }
+        if normalized.hasPrefix("en") { return "en" }
+        if normalized.hasPrefix("es") { return "es" }
+        if normalized.hasPrefix("fr") { return "fr" }
+        if normalized.hasPrefix("de") { return "de" }
+        if normalized.hasPrefix("pt") { return "pt" }
+        if normalized.hasPrefix("it") { return "it" }
+        if normalized.hasPrefix("ru") { return "ru" }
+        if normalized.hasPrefix("ar") { return "ar" }
+        if normalized.hasPrefix("th") { return "th" }
+        if normalized.hasPrefix("vi") { return "vi" }
+        if normalized.hasPrefix("id") { return "id" }
+        if normalized.hasPrefix("ms") { return "ms" }
+        return normalized
+    }
+
+    private static func inferLanguageCode(from segments: [HeadlessSegment]) -> String? {
+        let sample = segments
+            .prefix(20)
+            .map(\.text)
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !sample.isEmpty else { return nil }
+
+        var cjkCount = 0
+        var kanaCount = 0
+        var hangulCount = 0
+        var arabicCount = 0
+        var thaiCount = 0
+        var cyrillicCount = 0
+        var latinCount = 0
+
+        for scalar in sample.unicodeScalars {
+            switch scalar.value {
+            case 0x4E00...0x9FFF, 0x3400...0x4DBF:
+                cjkCount += 1
+            case 0x3040...0x309F, 0x30A0...0x30FF:
+                kanaCount += 1
+            case 0xAC00...0xD7AF:
+                hangulCount += 1
+            case 0x0600...0x06FF:
+                arabicCount += 1
+            case 0x0E00...0x0E7F:
+                thaiCount += 1
+            case 0x0400...0x04FF:
+                cyrillicCount += 1
+            case 0x0041...0x005A, 0x0061...0x007A,
+                 0x00C0...0x00D6, 0x00D8...0x00F6, 0x00F8...0x024F:
+                latinCount += 1
+            default:
+                break
+            }
+        }
+
+        if kanaCount > 0 { return "ja" }
+        if hangulCount > 0 { return "ko" }
+        if arabicCount > 0 { return "ar" }
+        if thaiCount > 0 { return "th" }
+        if cyrillicCount > 0 { return "ru" }
+        if cjkCount > 0 { return "zh" }
+
+        guard latinCount > 0 else { return nil }
+
+        let lowercased = sample.lowercased()
+        if lowercased.contains(where: { "¿¡ñáéíóúü".contains($0) }) { return "es" }
+        if lowercased.contains("ß") || lowercased.contains(where: { "äöü".contains($0) }) { return "de" }
+        if lowercased.contains(where: { "àâæçéèêëîïôœùûüÿ".contains($0) }) { return "fr" }
+        if lowercased.contains(where: { "ãõ".contains($0) }) { return "pt" }
+        if lowercased.contains(where: { "àèéìíîòóù".contains($0) }) { return "it" }
+        return "en"
     }
 
     private static func syncCoreMLAssetsIfAvailable(
@@ -700,6 +911,13 @@ private final class StreamCollector: @unchecked Sendable {
         return lines
     }
 
+    /// Flush any partial line remaining in the buffer after EOF.
+    func drainBuffer() -> [String] {
+        lock.withLock {
+            consumeLines(includePartial: true)
+        }
+    }
+
     func tail(maxLines: Int) -> String {
         lock.withLock {
             history.suffix(maxLines).joined(separator: "\n")
@@ -743,6 +961,20 @@ private struct DatasetsSegment: Codable {
 
 private struct PyannoteResult: Codable {
     let segments: [HeadlessSegment]
+}
+
+private struct ProofreadingPayload: Codable {
+    let segments: [HeadlessSegment]
+    let mode: String
+    let language: String
+}
+
+private struct ProofreadingResult: Codable {
+    let segments: [ProofreadingSegment]
+}
+
+private struct ProofreadingSegment: Codable {
+    let text: String
 }
 
 private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {
