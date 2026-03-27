@@ -64,6 +64,9 @@ cp "$WORKSPACE/Resources/Info.plist" "$APP_DIR/Contents/"
 if [[ -f "$WORKSPACE/Resources/AppIcon.icns" ]]; then
   cp "$WORKSPACE/Resources/AppIcon.icns" "$RES_DIR/"
 fi
+if [[ -f "$WORKSPACE/Resources/AppIconSource.png" ]]; then
+  cp "$WORKSPACE/Resources/AppIconSource.png" "$RES_DIR/"
+fi
 
 # Models and CoreML encoders are downloaded/prepared at runtime on first launch.
 # App bundle ships without model assets to stay minimal.

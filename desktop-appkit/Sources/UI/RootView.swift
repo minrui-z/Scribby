@@ -73,13 +73,17 @@ struct RootView: View {
         return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .center, spacing: 20) {
                 ZStack(alignment: .leading) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("逐字搞定 Beta")
-                            .font(.system(size: 58, weight: .bold, design: .serif))
-                            .tracking(-1.0)
-                        Text("語音轉譯")
-                            .font(.system(size: 21, weight: .medium))
-                            .foregroundStyle(secondaryInk)
+                    HStack(alignment: .center, spacing: 18) {
+                        headerBrandMark
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("逐字搞定 Beta")
+                                .font(.system(size: 48, weight: .regular))
+                                .tracking(-0.8)
+                            Text("語音轉譯")
+                                .font(.system(size: 18, weight: .regular))
+                                .foregroundStyle(secondaryInk)
+                        }
                     }
                     .opacity(model.showLiveHeader ? 0 : 1)
                     .offset(y: model.showLiveHeader ? -16 : 0)
@@ -117,6 +121,28 @@ struct RootView: View {
         .frame(maxWidth: constrainedToQueue ? queueAlignedWidth : .infinity, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: constrainedToQueue ? .center : .leading)
         .animation(.easeInOut(duration: 0.28), value: model.showLiveHeader)
+    }
+
+    private var headerBrandMark: some View {
+        Group {
+            if let path = Bundle.main.path(forResource: "AppIconSource", ofType: "png"),
+               let nsImage = NSImage(contentsOfFile: path) {
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.white.opacity(0.55))
+                    .overlay(
+                        Image(systemName: "waveform")
+                            .font(.system(size: 26, weight: .semibold))
+                            .foregroundStyle(primaryInk)
+                    )
+            }
+        }
+        .frame(width: 70, height: 70)
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
     private var listeningPill: some View {
