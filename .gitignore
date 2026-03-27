@@ -6,6 +6,7 @@ __pycache__/
 venv/
 .env
 desktop-appkit/.venv/
+desktop-appkit/.venv-coreml/
 desktop-appkit/.build/
 desktop-appkit/build/
 desktop-appkit/probe/

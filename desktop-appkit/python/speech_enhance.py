@@ -8,7 +8,20 @@ import sys
 import time
 
 
-DEFAULT_MODEL = "starkdmi/MossFormer2_SE_48K_MLX"
+MODEL_ALIASES = {
+    "default": "starkdmi/MossFormer2-SE",
+    "fp32": "starkdmi/MossFormer2-SE",
+    "fp16": "starkdmi/MossFormer2-SE-fp16",
+    "8bit": "starkdmi/MossFormer2-SE-8bit",
+    "6bit": "starkdmi/MossFormer2-SE-6bit",
+    "4bit": "starkdmi/MossFormer2-SE-4bit",
+    "starkdmi/MossFormer2-SE": "starkdmi/MossFormer2-SE",
+    "starkdmi/MossFormer2-SE-fp16": "starkdmi/MossFormer2-SE-fp16",
+    "starkdmi/MossFormer2-SE-8bit": "starkdmi/MossFormer2-SE-8bit",
+    "starkdmi/MossFormer2-SE-6bit": "starkdmi/MossFormer2-SE-6bit",
+    "starkdmi/MossFormer2-SE-4bit": "starkdmi/MossFormer2-SE-4bit",
+}
+DEFAULT_MODEL = MODEL_ALIASES["default"]
 TARGET_SR = 16_000
 
 
@@ -21,6 +34,18 @@ def _error(message: str, code: int = 1) -> None:
 def _log(message: str) -> None:
     sys.stderr.write(message.strip() + "\n")
     sys.stderr.flush()
+
+
+def _resolve_model_name(model_name: str) -> str:
+    normalized = (model_name or "").strip()
+    if not normalized:
+        return DEFAULT_MODEL
+    if normalized in MODEL_ALIASES:
+        return MODEL_ALIASES[normalized]
+    _error(
+        "不支援的人聲加強模型設定："
+        f"{normalized}\n目前支援：default / fp32 / fp16 / 8bit / 6bit / 4bit"
+    )
 
 
 def _resample(audio, orig_sr: int, target_sr: int):
@@ -46,8 +71,18 @@ def _load_model(model_name: str):
     import contextlib
 
     buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        model = MossFormer2SEModel.from_pretrained(model_name)
+    resolved_name = _resolve_model_name(model_name)
+    try:
+        with contextlib.redirect_stdout(buf):
+            model = MossFormer2SEModel.from_pretrained(resolved_name)
+    except Exception as exc:
+        text = str(exc)
+        if "404" in text or "Not Found" in text or "Repository Not Found" in text:
+            _error(
+                f"找不到人聲加強模型：{resolved_name}\n"
+                "請改用預設模型或稍後再試。"
+            )
+        _error(f"載入人聲加強模型失敗：{text}")
 
     for line in buf.getvalue().strip().splitlines():
         if line.strip():

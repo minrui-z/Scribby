@@ -32,8 +32,10 @@ final class NativeAppModel: ObservableObject {
 
     private var provider: TranscriptionProvider
     private let dialogs: DialogService
+    private weak var window: NSWindow?
     private var pendingFloatingFragments: [String] = []
     private var floatingDrainTask: Task<Void, Never>?
+    private var workspaceObservers: [NSObjectProtocol] = []
 
     convenience init() {
         self.init(
@@ -68,12 +70,16 @@ final class NativeAppModel: ObservableObject {
         queueItems.contains { !["done", "error", "stopped"].contains($0.status) } && !isProcessing
     }
 
+    var canResume: Bool {
+        isPaused && queueItems.contains { $0.status == "pending" }
+    }
+
     var showCompactAddButton: Bool {
-        isProcessing
+        isProcessing || isPaused
     }
 
     var showLiveHeader: Bool {
-        isProcessing
+        isProcessing || isPaused
     }
 
     var currentProcessingItem: QueueItemModel? {
@@ -84,7 +90,7 @@ final class NativeAppModel: ObservableObject {
     var batchNote: String {
         diarizeEnabled
             ? "已開啟語者辨識。這條路只走 pyannote 多語者 diarization，需要 HuggingFace Token。首次執行可能因模型下載而較久。"
-            : "純 Swift 核心版第一階段支援單檔或批次順序轉譯，暫不支援暫停與停止。"
+            : "純 Swift 核心版支援單檔或批次順序轉譯，可安全暫停或停止目前檔案。"
     }
 
     func bootstrap() {
@@ -101,6 +107,7 @@ final class NativeAppModel: ObservableObject {
                     supportsHardStop = info.supportsHardStop
                     setPickerStatus("桌面版已就緒", tone: .success)
                     setActionStatus("SwiftWhisper 純 Swift 核心已就緒", tone: .success)
+                    startObservingSystemSleep()
                 } catch {
                     setActionStatus("啟動 backend 失敗: \(error.localizedDescription)", tone: .error)
                 }
@@ -112,12 +119,14 @@ final class NativeAppModel: ObservableObject {
     }
 
     func shutdown() {
+        stopObservingSystemSleep()
         floatingDrainTask?.cancel()
         floatingDrainTask = nil
         provider.shutdown()
     }
 
     func attach(window: NSWindow?) {
+        self.window = window
         dialogs.attach(window: window)
     }
 
@@ -128,9 +137,13 @@ final class NativeAppModel: ObservableObject {
     }
 
     func closeSettings() {
-        withAnimation(.linear(duration: 0.22)) {
+        withAnimation(.easeInOut(duration: 0.28)) {
             showSettings = false
         }
+    }
+
+    func setWindowBackgroundMovable(_ movable: Bool) {
+        window?.isMovableByWindowBackground = movable
     }
 
     func switchModel(to preset: WhisperModelPreset) {
@@ -247,11 +260,34 @@ final class NativeAppModel: ObservableObject {
     }
 
     func togglePause() {
-        setActionStatus("純 Swift 核心版第一階段不支援暫停", tone: .error)
+        if isPaused {
+            setActionStatus("正在恢復轉譯...", tone: .neutral)
+        } else {
+            setActionStatus("正在暫停目前佇列...", tone: .neutral)
+        }
+        Task {
+            do {
+                let snapshot = try await provider.setPaused(!isPaused)
+                applySnapshot(snapshot)
+            } catch {
+                setActionStatus(error.localizedDescription, tone: .error)
+            }
+        }
     }
 
     func stopCurrent() {
-        setActionStatus("純 Swift 核心版第一階段不支援停止", tone: .error)
+        setActionStatus("正在停止目前檔案...", tone: .neutral)
+        Task {
+            do {
+                let result = try await provider.stopCurrent()
+                applySnapshot(result.snapshot)
+                if !result.accepted {
+                    setActionStatus(result.message, tone: .neutral)
+                }
+            } catch {
+                setActionStatus(error.localizedDescription, tone: .error)
+            }
+        }
     }
 
     func clearQueue() {
@@ -260,6 +296,14 @@ final class NativeAppModel: ObservableObject {
             do {
                 let snapshot = try await provider.clearQueue()
                 applySnapshot(snapshot)
+                if snapshot.items.isEmpty {
+                    stopFloatingTranscript(clearVisible: true)
+                    isProcessing = false
+                    isPaused = false
+                    stopRequested = false
+                    currentFileId = nil
+                    setPickerStatus("桌面版已就緒", tone: .success)
+                }
                 setActionStatus("", tone: .neutral)
             } catch {
                 setActionStatus("清除全部失敗: \(error.localizedDescription)", tone: .error)
@@ -272,6 +316,16 @@ final class NativeAppModel: ObservableObject {
             do {
                 let snapshot = try await provider.removeQueueItem(fileId: item.fileId)
                 applySnapshot(snapshot)
+                if snapshot.items.isEmpty {
+                    stopFloatingTranscript(clearVisible: true)
+                    isProcessing = false
+                    isPaused = false
+                    stopRequested = false
+                    currentFileId = nil
+                    setPickerStatus("桌面版已就緒", tone: .success)
+                    setActionStatus("", tone: .neutral)
+                    return
+                }
                 setActionStatus("已刪除 \(item.filename)", tone: .success)
             } catch {
                 setActionStatus("刪除失敗: \(error.localizedDescription)", tone: .error)
@@ -339,6 +393,7 @@ final class NativeAppModel: ObservableObject {
         case .queueUpdated(let snapshot):
             applySnapshot(snapshot)
         case .queuePaused(let message):
+            stopFloatingTranscript(clearVisible: true)
             setActionStatus(message, tone: .neutral)
         case .queueResumed(let message):
             setActionStatus(message, tone: .success)
@@ -359,7 +414,7 @@ final class NativeAppModel: ObservableObject {
             setActionStatus(message, tone: .error)
         case .taskStopped(_, let message):
             stopFloatingTranscript(clearVisible: true)
-            setActionStatus(message, tone: .error)
+            setActionStatus(message, tone: .neutral)
         case .taskPhaseChanged(let fileId, let phase, let activePhases):
             if let idx = queueItems.firstIndex(where: { $0.fileId == fileId }) {
                 queueItems[idx].phase = phase
@@ -421,6 +476,57 @@ final class NativeAppModel: ObservableObject {
     private func setActionStatus(_ message: String, tone: StatusTone) {
         actionStatus = message
         actionStatusTone = tone
+    }
+
+    private func startObservingSystemSleep() {
+        guard workspaceObservers.isEmpty else { return }
+        let center = NSWorkspace.shared.notificationCenter
+
+        let willSleep = center.addObserver(
+            forName: NSWorkspace.willSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleSystemWillSleep()
+            }
+        }
+
+        let didWake = center.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleSystemDidWake()
+            }
+        }
+
+        workspaceObservers = [willSleep, didWake]
+    }
+
+    private func stopObservingSystemSleep() {
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers.forEach { center.removeObserver($0) }
+        workspaceObservers.removeAll()
+    }
+
+    private func handleSystemWillSleep() {
+        guard isProcessing, !isPaused else { return }
+        setActionStatus("系統即將睡眠，已自動暫停目前佇列", tone: .neutral)
+        Task {
+            do {
+                let snapshot = try await provider.setPaused(true)
+                applySnapshot(snapshot)
+            } catch {
+                setActionStatus("系統睡眠前自動暫停失敗: \(error.localizedDescription)", tone: .error)
+            }
+        }
+    }
+
+    private func handleSystemDidWake() {
+        guard isPaused else { return }
+        setActionStatus("已從睡眠恢復，請手動繼續", tone: .neutral)
     }
 
     private func appendDiagnosticLog(_ message: String) {

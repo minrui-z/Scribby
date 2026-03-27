@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 struct RootView: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ObservedObject var model: NativeAppModel
+    @State private var hoveredControlHint: HoverControlHint?
     private let primaryInk = Color(red: 0.16, green: 0.14, blue: 0.12)
     private let secondaryInk = Color(red: 0.34, green: 0.31, blue: 0.28)
     private let tokenURL = URL(string: "https://huggingface.co/settings/tokens")!
@@ -36,7 +37,13 @@ struct RootView: View {
 
                 if model.showSettings {
                     settingsOverlay
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                        .zIndex(3)
+                        .transition(
+                            .asymmetric(
+                                insertion: .move(edge: .trailing).combined(with: .opacity),
+                                removal: .move(edge: .trailing).combined(with: .opacity)
+                            )
+                        )
                 }
             }
         }
@@ -91,6 +98,13 @@ struct RootView: View {
                 headerChrome
             }
 
+            if model.isPaused {
+                Text("恢復後會重新開始目前檔案")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(secondaryInk)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
             if !model.isProcessing,
                let action = quietActionStatus {
                 Text(action)
@@ -107,14 +121,14 @@ struct RootView: View {
     private var listeningPill: some View {
         HStack(spacing: 10) {
             Circle()
-                .fill(Color(red: 0.97, green: 0.35, blue: 0.31))
+                .fill(model.isPaused ? Color(red: 0.89, green: 0.63, blue: 0.12) : Color(red: 0.97, green: 0.35, blue: 0.31))
                 .frame(width: 10, height: 10)
                 .overlay(
                     Circle()
-                        .stroke(Color(red: 0.97, green: 0.35, blue: 0.31).opacity(0.34), lineWidth: 4)
+                        .stroke((model.isPaused ? Color(red: 0.89, green: 0.63, blue: 0.12) : Color(red: 0.97, green: 0.35, blue: 0.31)).opacity(0.34), lineWidth: 4)
                         .scaleEffect(1.15)
                 )
-            Text("正在聆聽…")
+            Text(model.isPaused ? "已暫停" : "正在聆聽…")
                 .font(.system(size: 17, weight: .semibold))
         }
         .padding(.horizontal, 18)
@@ -214,7 +228,7 @@ struct RootView: View {
         let zoneHeight = primaryDropZoneHeight(for: availableHeight, compact: compactDropZone || hasQueue)
         let sharedWidth = initialColumnWidth(for: availableWidth)
         return VStack(spacing: 22) {
-            if !model.isProcessing {
+            if !model.isProcessing && !model.isPaused {
                 dropZone(minHeight: zoneHeight, compact: compactDropZone || hasQueue)
                     .frame(maxWidth: sharedWidth, alignment: .leading)
                     .transition(.asymmetric(
@@ -345,22 +359,74 @@ struct RootView: View {
             if showControls {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 12) {
-                        Button(action: model.startTranscription) {
-                            HStack {
-                                Image(systemName: model.isProcessing ? "waveform.and.magnifyingglass" : "play.fill")
-                                    .font(.system(size: 13, weight: .bold))
-                                Text(model.isProcessing ? "轉譯中..." : "開始轉譯")
+                        if model.isPaused {
+                            Button(action: model.togglePause) {
+                                HStack {
+                                    Image(systemName: "play.fill")
+                                        .font(.system(size: 13, weight: .bold))
+                                    Text("繼續")
+                                }
                             }
-                        }
-                        .buttonStyle(PrimaryActionButtonStyle(enabled: model.canStart))
-                        .disabled(!model.canStart)
+                            .buttonStyle(PrimaryActionButtonStyle(enabled: model.canResume))
+                            .disabled(!model.canResume)
 
-                        Button("清除全部") {
-                            model.clearQueue()
+                            Button("清除全部") {
+                                model.clearQueue()
+                            }
+                            .buttonStyle(SecondaryActionButtonStyle())
+                            .foregroundStyle(secondaryInk)
+                            .disabled(model.queueItems.isEmpty)
+                        } else if model.isProcessing {
+                            Button(action: model.togglePause) {
+                                HStack {
+                                    Image(systemName: "pause.fill")
+                                        .font(.system(size: 13, weight: .bold))
+                                    Text("暫停")
+                                }
+                            }
+                            .buttonStyle(PrimaryActionButtonStyle(enabled: true))
+                            .onHover { isHovering in
+                                withAnimation(.easeOut(duration: 0.16)) {
+                                    hoveredControlHint = isHovering ? .pause : nil
+                                }
+                            }
+
+                            Button("停止") {
+                                model.stopCurrent()
+                            }
+                            .buttonStyle(SecondaryActionButtonStyle())
+                            .foregroundStyle(secondaryInk)
+                            .disabled(!model.supportsHardStop)
+                            .onHover { isHovering in
+                                withAnimation(.easeOut(duration: 0.16)) {
+                                    hoveredControlHint = isHovering ? .stop : nil
+                                }
+                            }
+                        } else {
+                            Button(action: model.startTranscription) {
+                                HStack {
+                                    Image(systemName: "play.fill")
+                                        .font(.system(size: 13, weight: .bold))
+                                    Text("開始轉譯")
+                                }
+                            }
+                            .buttonStyle(PrimaryActionButtonStyle(enabled: model.canStart))
+                            .disabled(!model.canStart)
+
+                            Button("清除全部") {
+                                model.clearQueue()
+                            }
+                            .buttonStyle(SecondaryActionButtonStyle())
+                            .foregroundStyle(secondaryInk)
+                            .disabled(model.queueItems.isEmpty || model.isProcessing)
                         }
-                        .buttonStyle(SecondaryActionButtonStyle())
-                        .foregroundStyle(secondaryInk)
-                        .disabled(model.queueItems.isEmpty || model.isProcessing)
+                    }
+                    .overlay(alignment: .top) {
+                        if let text = hoveredControlHintText {
+                            HoverHintBubble(text: text)
+                                .offset(y: -48)
+                                .transition(.move(edge: .top).combined(with: .opacity))
+                        }
                     }
                     .padding(.top, 2)
                 }
@@ -477,7 +543,7 @@ struct RootView: View {
                 }
                 .padding(.bottom, 22)
 
-                ScrollView(.vertical, showsIndicators: true) {
+                ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 22) {
 
                 VStack(alignment: .leading, spacing: 12) {
@@ -492,7 +558,9 @@ struct RootView: View {
                         }
                     }
                     .toggleStyle(.switch)
+                    .modifier(WindowDragBlocker(model: model))
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(18)
                 .background(
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
@@ -511,6 +579,7 @@ struct RootView: View {
                         }
                     }
                     .toggleStyle(.switch)
+                    .modifier(WindowDragBlocker(model: model))
                 }
                 .padding(18)
                 .background(
@@ -613,6 +682,7 @@ struct RootView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(18)
                 .background(
                     RoundedRectangle(cornerRadius: 20, style: .continuous)
@@ -632,7 +702,7 @@ struct RootView: View {
             .padding(.trailing, 24)
             .shadow(color: Color(red: 0.28, green: 0.20, blue: 0.12).opacity(0.05), radius: 18, x: -4, y: 6)
         }
-        .animation(.linear(duration: 0.22), value: model.showSettings)
+        .animation(.easeInOut(duration: 0.28), value: model.showSettings)
     }
 
     private func loadDroppedPaths(from providers: [NSItemProvider]) {
@@ -702,6 +772,17 @@ struct RootView: View {
 
     private var queueAnimationSignature: String {
         model.queueItems.map { "\($0.id):\($0.status):\($0.progress)" }.joined(separator: "|")
+    }
+
+    private var hoveredControlHintText: String? {
+        switch hoveredControlHint {
+        case .pause:
+            return "會暫停佇列，恢復後會重新開始目前檔案"
+        case .stop:
+            return "會停止目前檔案，本次不會自動繼續"
+        case .none:
+            return nil
+        }
     }
 
     private var showResultsSection: Bool {
@@ -776,6 +857,70 @@ struct RootView: View {
         return max(min(cardHeight * 0.52, cardHeight - reservedChrome), 144)
     }
 
+}
+
+private enum HoverControlHint {
+    case pause
+    case stop
+}
+
+private struct HoverHintBubble: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(Color.white)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.black.opacity(0.82))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 1)
+            )
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: 240)
+            .allowsHitTesting(false)
+            .shadow(color: Color.black.opacity(0.16), radius: 12, x: 0, y: 6)
+    }
+}
+
+private struct WindowDragBlocker: ViewModifier {
+    @ObservedObject var model: NativeAppModel
+    @State private var isDraggingControl = false
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .highPriorityGesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { _ in
+                        guard !isDraggingControl else { return }
+                        isDraggingControl = true
+                        model.setWindowBackgroundMovable(false)
+                    }
+                    .onEnded { _ in
+                        isDraggingControl = false
+                        model.setWindowBackgroundMovable(true)
+                    }
+            )
+            .simultaneousGesture(
+                TapGesture()
+                    .onEnded {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            model.setWindowBackgroundMovable(true)
+                        }
+                    }
+            )
+            .onDisappear {
+                isDraggingControl = false
+                model.setWindowBackgroundMovable(true)
+            }
+    }
 }
 
 private struct QueueRow: View {

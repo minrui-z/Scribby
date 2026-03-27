@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 enum PythonDependencyGroup: String, CaseIterable {
@@ -18,16 +19,25 @@ enum PythonDependencyGroup: String, CaseIterable {
         }
     }
 
-    /// Version check script: verifies the package can be imported AND the pinned
-    /// version matches.  Returns a Python one-liner suitable for `python -c`.
+    /// Capability check script: verifies the package can be imported and the
+    /// pinned versions / public APIs actually work. Returns a Python snippet
+    /// suitable for `python -c`.
     var versionCheckScript: String {
         switch self {
         case .enhancement:
-            // Check that mlx_audio is importable and its version matches the pin.
+            // `mlx_audio` does not reliably expose `__version__`, so use
+            // importlib.metadata and validate the symbols used by the helper.
             return """
+            from importlib.metadata import version; \
+            import soundfile; \
             import mlx_audio; \
-            assert mlx_audio.__version__ == '0.4.1', \
-            f'want 0.4.1 got {mlx_audio.__version__}'
+            from mlx_audio.sts import MossFormer2SEModel; \
+            assert version('mlx-audio') == '0.4.1', \
+            f"want mlx-audio 0.4.1 got {version('mlx-audio')}"; \
+            assert version('mlx') == '0.31.1', \
+            f"want mlx 0.31.1 got {version('mlx')}"; \
+            assert version('soundfile') == '0.13.1', \
+            f"want soundfile 0.13.1 got {version('soundfile')}"
             """
         case .diarization:
             return "import pyannote.audio"
@@ -81,6 +91,7 @@ actor PythonEnvironmentManager {
     static let shared = PythonEnvironmentManager()
 
     private var readyGroups: Set<PythonDependencyGroup> = []
+    private var activeProcessID: Int32?
 
     private var venvDirectory: URL {
         get throws {
@@ -104,6 +115,23 @@ actor PythonEnvironmentManager {
 
     func pythonExecutable() throws -> URL {
         try venvPython
+    }
+
+    func cancelCurrentWork() async {
+        guard let pid = activeProcessID, pid > 0 else { return }
+        activeProcessID = nil
+
+        if kill(pid, 0) == 0 {
+            kill(pid, SIGINT)
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        if kill(pid, 0) == 0 {
+            kill(pid, SIGTERM)
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        if kill(pid, 0) == 0 {
+            kill(pid, SIGKILL)
+        }
     }
 
     func ensureReady(
@@ -207,7 +235,9 @@ actor PythonEnvironmentManager {
         process.standardError = stderr
 
         try process.run()
+        activeProcessID = process.processIdentifier
         process.waitUntilExit()
+        activeProcessID = nil
 
         guard process.terminationStatus == 0 else {
             let errText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
@@ -223,7 +253,9 @@ actor PythonEnvironmentManager {
         pip.standardOutput = FileHandle.nullDevice
         pip.standardError = FileHandle.nullDevice
         try pip.run()
+        activeProcessID = pip.processIdentifier
         pip.waitUntilExit()
+        activeProcessID = nil
     }
 
     private func findSystemPython(log: @escaping @Sendable (String) -> Void) async throws -> URL {
@@ -329,7 +361,9 @@ actor PythonEnvironmentManager {
 
         do {
             try process.run()
+            activeProcessID = process.processIdentifier
             process.waitUntilExit()
+            activeProcessID = nil
             return process.terminationStatus == 0
         } catch {
             return false
@@ -480,7 +514,9 @@ actor PythonEnvironmentManager {
         }
 
         try process.run()
+        activeProcessID = process.processIdentifier
         process.waitUntilExit()
+        activeProcessID = nil
         stderrHandle.readabilityHandler = nil
         stdoutHandle.readabilityHandler = nil
 

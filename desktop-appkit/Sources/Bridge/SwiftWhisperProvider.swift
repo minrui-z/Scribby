@@ -1,4 +1,5 @@
 import AVFoundation
+import Darwin
 import Foundation
 
 @MainActor
@@ -8,11 +9,14 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     private var snapshot = ProviderSnapshot.empty
     private var workerTask: Task<Void, Never>?
     private let modelPreset: WhisperModelPreset
+    private let activeProcesses = ActiveProcessRegistry()
+    private var pendingControlAction: ControlAction?
+    private var lastTranscriptionRequest: TranscriptionRequest?
     private var info = ProviderInfo(
         engine: "swiftwhisper",
         model: WhisperModelPreset.default.displayName,
         device: "native-swift",
-        supportsHardStop: false,
+        supportsHardStop: true,
         snapshot: .empty
     )
 
@@ -28,8 +32,13 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     }
 
     func shutdown() {
+        pendingControlAction = .shutdown
         workerTask?.cancel()
         workerTask = nil
+        Task {
+            await activeProcesses.terminateAll()
+            await PythonEnvironmentManager.shared.cancelCurrentWork()
+        }
     }
 
     func getInfo() async throws -> ProviderInfo {
@@ -45,7 +54,11 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     }
 
     func enqueue(paths: [String]) async throws -> ProviderSnapshot {
-        let newItems = try paths.map(Self.makeQueueItem)
+        var occupiedNames = Set(snapshot.items.map(\.filename))
+        let newItems = try paths.map { path in
+            let item = try Self.makeQueueItem(path: path, occupiedNames: &occupiedNames)
+            return item
+        }
         snapshot.items.append(contentsOf: newItems)
         syncInfo()
         onEvent?(.queueUpdated(snapshot))
@@ -66,6 +79,8 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             throw unsupported("目前沒有可轉譯的檔案")
         }
 
+        lastTranscriptionRequest = request
+        pendingControlAction = nil
         snapshot.isProcessing = true
         snapshot.isPaused = false
         snapshot.stopRequested = false
@@ -81,11 +96,78 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     }
 
     func setPaused(_ paused: Bool) async throws -> ProviderSnapshot {
-        throw unsupported("純 Swift 核心版第一階段不支援暫停")
+        if paused {
+            guard !snapshot.isPaused else { return snapshot }
+            snapshot.isPaused = true
+            snapshot.stopRequested = snapshot.isProcessing
+            pendingControlAction = .pause
+            syncInfo()
+            onEvent?(.queueUpdated(snapshot))
+
+            if snapshot.isProcessing {
+                workerTask?.cancel()
+                await activeProcesses.terminateAll()
+                await PythonEnvironmentManager.shared.cancelCurrentWork()
+            } else {
+                onEvent?(.queuePaused("已暫停，恢復後會重新開始目前檔案"))
+                onEvent?(.queueUpdated(snapshot))
+            }
+            return snapshot
+        } else {
+            guard snapshot.isPaused else { return snapshot }
+            guard let request = lastTranscriptionRequest else {
+                throw unsupported("目前沒有可恢復的轉譯任務")
+            }
+
+            snapshot.isPaused = false
+            snapshot.stopRequested = false
+            pendingControlAction = nil
+            syncInfo()
+            onEvent?(.queueResumed("已恢復轉譯"))
+            onEvent?(.queueUpdated(snapshot))
+
+            if snapshot.items.contains(where: { $0.status == "pending" }) {
+                snapshot.isProcessing = true
+                syncInfo()
+                onEvent?(.queueUpdated(snapshot))
+
+                workerTask?.cancel()
+                workerTask = Task { [weak self] in
+                    guard let self else { return }
+                    await self.processPending(request: request)
+                }
+            }
+            return snapshot
+        }
     }
 
     func stopCurrent() async throws -> StopRequestResult {
-        throw unsupported("純 Swift 核心版第一階段不支援停止")
+        guard snapshot.isProcessing, snapshot.currentFileId != nil else {
+            return StopRequestResult(
+                accepted: false,
+                hardStopped: false,
+                supportsHardStop: true,
+                message: "目前沒有可停止的檔案",
+                snapshot: snapshot
+            )
+        }
+
+        pendingControlAction = .stop
+        snapshot.stopRequested = true
+        syncInfo()
+        onEvent?(.queueUpdated(snapshot))
+
+        workerTask?.cancel()
+        await activeProcesses.terminateAll()
+        await PythonEnvironmentManager.shared.cancelCurrentWork()
+
+        return StopRequestResult(
+            accepted: true,
+            hardStopped: true,
+            supportsHardStop: true,
+            message: "正在停止目前檔案...",
+            snapshot: snapshot
+        )
     }
 
     func clearQueue() async throws -> ProviderSnapshot {
@@ -106,6 +188,12 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             throw unsupported("轉譯中的檔案無法刪除")
         }
         snapshot.items.remove(at: index)
+        if snapshot.items.isEmpty {
+            snapshot.currentFileId = nil
+            snapshot.isProcessing = false
+            snapshot.isPaused = false
+            snapshot.stopRequested = false
+        }
         syncInfo()
         onEvent?(.queueUpdated(snapshot))
         return snapshot
@@ -126,6 +214,9 @@ final class SwiftWhisperProvider: TranscriptionProvider {
 
     private func processPending(request: TranscriptionRequest) async {
         while let index = snapshot.items.firstIndex(where: { $0.status == "pending" }) {
+            if Task.isCancelled || snapshot.isPaused {
+                break
+            }
             let item = snapshot.items[index]
 
             // Determine active phases for this task
@@ -144,6 +235,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             onEvent?(.queueUpdated(snapshot))
 
             var enhancedTempURL: URL?
+            var shouldBreakLoop = false
 
 
             do {
@@ -164,6 +256,11 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     snapshot.items[index].phase = initialPhase
                     onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: initialPhase, activePhases: activePhases))
                     onEvent?(.queueUpdated(snapshot))
+
+                    if let action = pendingControlAction {
+                        shouldBreakLoop = handleControlAction(action, at: index, fallbackFilename: item.filename)
+                        throw CancellationError()
+                    }
                 }
                 if request.diarize {
                     onEvent?(.taskProgress(fileId: item.fileId, message: "正在準備語者辨識環境...", progress: nil))
@@ -181,6 +278,11 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     snapshot.items[index].phase = initialPhase
                     onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: initialPhase, activePhases: activePhases))
                     onEvent?(.queueUpdated(snapshot))
+
+                    if let action = pendingControlAction {
+                        shouldBreakLoop = handleControlAction(action, at: index, fallbackFilename: item.filename)
+                        throw CancellationError()
+                    }
                 }
 
                 let audioPath: String
@@ -192,8 +294,9 @@ final class SwiftWhisperProvider: TranscriptionProvider {
 
                     // Python outputs 16kHz mono PCM WAV directly
                     try await Self.runSpeechEnhancement(
-                        filePath: item.id,
+                        filePath: item.sourcePath,
                         outputPath: tempURL.path,
+                        processRegistry: activeProcesses,
                         log: { [weak self] line in
                             Task { @MainActor in
                                 guard let self else { return }
@@ -223,7 +326,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 } else {
                     // Pass the original file directly — headless has its own
                     // fallback chain: AVFoundation → direct WAV parse → ffmpeg.
-                    audioPath = item.id
+                    audioPath = item.sourcePath
                 }
 
                 let result = try await Self.runHeadless(
@@ -231,6 +334,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     language: request.language,
                     diarize: false,
                     modelPreset: modelPreset,
+                    processRegistry: activeProcesses,
                     event: { [weak self] streamEvent in
                         Task { @MainActor in
                             guard let self else { return }
@@ -270,6 +374,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                         token: request.token,
                         speakers: request.speakers,
                         segments: result.segments,
+                        processRegistry: activeProcesses,
                         log: { [weak self] line in
                             Task { @MainActor in
                                 guard let self else { return }
@@ -291,19 +396,55 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 applyResult(finalResult, to: index, diarizeRequested: request.diarize, usedPyannote: request.diarize)
                 onEvent?(.taskCompleted(fileId: item.fileId, filename: item.filename, result: snapshot.items[index].result!))
                 onEvent?(.queueUpdated(snapshot))
+
+                if let action = pendingControlAction {
+                    pendingControlAction = nil
+                    snapshot.currentFileId = nil
+                    snapshot.isProcessing = false
+                    snapshot.stopRequested = false
+                    if action == .pause {
+                        snapshot.isPaused = true
+                        syncInfo()
+                        onEvent?(.queuePaused("已暫停，恢復後會重新開始下一個檔案"))
+                        onEvent?(.queueUpdated(snapshot))
+                    } else if action == .sleepPause {
+                        snapshot.isPaused = true
+                        syncInfo()
+                        onEvent?(.queuePaused("系統即將睡眠，已自動暫停目前佇列"))
+                        onEvent?(.queueUpdated(snapshot))
+                    } else {
+                        snapshot.isPaused = false
+                        syncInfo()
+                        onEvent?(.queueUpdated(snapshot))
+                    }
+                    shouldBreakLoop = true
+                }
             } catch {
-                applyFailure(error, to: index)
-                onEvent?(.taskFailed(fileId: item.fileId, message: error.localizedDescription))
-                onEvent?(.queueUpdated(snapshot))
+                if shouldBreakLoop {
+                    // Control action already handled before the throw.
+                } else if let action = pendingControlAction {
+                    shouldBreakLoop = handleControlAction(action, at: index, fallbackFilename: item.filename)
+                } else {
+                    applyFailure(error, to: index)
+                    onEvent?(.taskFailed(fileId: item.fileId, message: error.localizedDescription))
+                    onEvent?(.queueUpdated(snapshot))
+                }
             }
 
             if let tempURL = enhancedTempURL {
                 try? FileManager.default.removeItem(at: tempURL)
             }
+
+            if shouldBreakLoop || Task.isCancelled || snapshot.isPaused {
+                break
+            }
         }
 
-        snapshot.isProcessing = false
-        snapshot.currentFileId = nil
+        if !snapshot.items.contains(where: { $0.status == "processing" }) {
+            snapshot.isProcessing = false
+            snapshot.currentFileId = nil
+            snapshot.stopRequested = false
+        }
         syncInfo()
         onEvent?(.queueUpdated(snapshot))
     }
@@ -446,11 +587,78 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         snapshot.items[index].message = ""
         snapshot.items[index].error = error.localizedDescription
         snapshot.items[index].result = nil
+        snapshot.items[index].phase = nil
+        snapshot.items[index].activePhases = []
+        snapshot.items[index].downloadProgress = nil
         syncInfo()
     }
 
     private func syncInfo() {
+        info.supportsHardStop = true
         info.snapshot = snapshot
+    }
+
+    @discardableResult
+    private func handleControlAction(_ action: ControlAction, at index: Int, fallbackFilename: String) -> Bool {
+        pendingControlAction = nil
+
+        switch action {
+        case .pause:
+            snapshot.items[index].status = "pending"
+            snapshot.items[index].progress = 0
+            snapshot.items[index].message = ""
+            snapshot.items[index].error = nil
+            snapshot.items[index].phase = nil
+            snapshot.items[index].activePhases = []
+            snapshot.items[index].downloadProgress = nil
+            snapshot.currentFileId = nil
+            snapshot.isProcessing = false
+            snapshot.isPaused = true
+            snapshot.stopRequested = false
+            syncInfo()
+            onEvent?(.queuePaused("已暫停，恢復後會重新開始目前檔案"))
+            onEvent?(.queueUpdated(snapshot))
+            return true
+        case .sleepPause:
+            snapshot.items[index].status = "pending"
+            snapshot.items[index].progress = 0
+            snapshot.items[index].message = ""
+            snapshot.items[index].error = nil
+            snapshot.items[index].phase = nil
+            snapshot.items[index].activePhases = []
+            snapshot.items[index].downloadProgress = nil
+            snapshot.currentFileId = nil
+            snapshot.isProcessing = false
+            snapshot.isPaused = true
+            snapshot.stopRequested = false
+            syncInfo()
+            onEvent?(.queuePaused("系統即將睡眠，已自動暫停目前佇列"))
+            onEvent?(.queueUpdated(snapshot))
+            return true
+        case .stop:
+            snapshot.items[index].status = "stopped"
+            snapshot.items[index].progress = 0
+            snapshot.items[index].message = ""
+            snapshot.items[index].error = nil
+            snapshot.items[index].result = nil
+            snapshot.items[index].phase = nil
+            snapshot.items[index].activePhases = []
+            snapshot.items[index].downloadProgress = nil
+            snapshot.currentFileId = nil
+            snapshot.isProcessing = false
+            snapshot.isPaused = false
+            snapshot.stopRequested = false
+            syncInfo()
+            onEvent?(.taskStopped(fileId: snapshot.items[index].fileId, message: "已停止目前檔案"))
+            onEvent?(.queueUpdated(snapshot))
+            return true
+        case .shutdown:
+            snapshot.currentFileId = nil
+            snapshot.isProcessing = false
+            snapshot.stopRequested = false
+            syncInfo()
+            return true
+        }
     }
 
     private func unsupported(_ message: String) -> Error {
@@ -492,15 +700,17 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         return String(format: "%02d:%02d", minutes, seconds)
     }
 
-    private static func makeQueueItem(path: String) throws -> QueueItemModel {
+    private static func makeQueueItem(path: String, occupiedNames: inout Set<String>) throws -> QueueItemModel {
         let url = URL(fileURLWithPath: path)
         let attributes = try? FileManager.default.attributesOfItem(atPath: path)
         let size = attributes?[.size] as? NSNumber
         let fileId = UUID().uuidString
+        let filename = uniqueDisplayName(for: url.lastPathComponent, occupiedNames: &occupiedNames)
         return QueueItemModel(
-            id: path,
+            id: fileId,
             fileId: fileId,
-            filename: url.lastPathComponent,
+            sourcePath: path,
+            filename: filename,
             size: size?.int64Value ?? 0,
             status: "pending",
             progress: 0,
@@ -510,11 +720,40 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         )
     }
 
+    private static func uniqueDisplayName(for original: String, occupiedNames: inout Set<String>) -> String {
+        if !occupiedNames.contains(original) {
+            occupiedNames.insert(original)
+            return original
+        }
+
+        let url = URL(fileURLWithPath: original)
+        let ext = url.pathExtension
+        let stem = url.deletingPathExtension().lastPathComponent
+
+        for index in 2...999 {
+            let candidate: String
+            if ext.isEmpty {
+                candidate = "\(stem) (\(index))"
+            } else {
+                candidate = "\(stem) (\(index)).\(ext)"
+            }
+            if !occupiedNames.contains(candidate) {
+                occupiedNames.insert(candidate)
+                return candidate
+            }
+        }
+
+        let fallback = "\(stem)-\(UUID().uuidString.prefix(6))" + (ext.isEmpty ? "" : ".\(ext)")
+        occupiedNames.insert(fallback)
+        return fallback
+    }
+
     private static func runHeadless(
         filePath: String,
         language: String,
         diarize: Bool,
         modelPreset: WhisperModelPreset,
+        processRegistry: ActiveProcessRegistry,
         event: @escaping @Sendable (HeadlessStreamEvent) -> Void,
         log: @escaping @Sendable (String) -> Void = { _ in },
         downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void = { _, _, _ in }
@@ -595,7 +834,9 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             }
 
             try process.run()
+            await processRegistry.register(pid: process.processIdentifier, for: .headless)
             process.waitUntilExit()
+            await processRegistry.clear(.headless, matching: process.processIdentifier)
             stdoutHandle.readabilityHandler = nil
             stderrHandle.readabilityHandler = nil
 
@@ -630,10 +871,18 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             }
 
             guard let completedResult = streamCollector.completedResult() else {
+                let stderrTail = collectedStderr.tail(maxLines: 8)
+                let stdoutTail = streamCollector.tail(maxLines: 8)
                 throw NSError(
                     domain: "SwiftWhisperProvider",
                     code: 2,
-                    userInfo: [NSLocalizedDescriptionKey: "SwiftWhisper 沒有回傳最終結果"]
+                    userInfo: [NSLocalizedDescriptionKey: """
+                    SwiftWhisper 沒有回傳最終結果（exit=0）
+                    stderr:
+                    \(stderrTail.isEmpty ? "（空）" : stderrTail)
+                    stdout:
+                    \(stdoutTail.isEmpty ? "（空）" : stdoutTail)
+                    """]
                 )
             }
             return completedResult
@@ -769,6 +1018,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     private static func runSpeechEnhancement(
         filePath: String,
         outputPath: String,
+        processRegistry: ActiveProcessRegistry,
         log: @escaping @Sendable (String) -> Void,
         downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void = { _, _, _ in }
     ) async throws {
@@ -814,7 +1064,9 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             }
 
             try process.run()
+            await processRegistry.register(pid: process.processIdentifier, for: .enhancement)
             process.waitUntilExit()
+            await processRegistry.clear(.enhancement, matching: process.processIdentifier)
             stderrHandle.readabilityHandler = nil
 
             guard process.terminationStatus == 0 else {
@@ -873,18 +1125,6 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         let outputURL = URL(fileURLWithPath: outputPath)
         try? FileManager.default.removeItem(at: outputURL)
 
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            Self.convertWithAVAsset(inputURL: inputURL, outputURL: outputURL) { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume()
-                }
-            }
-        }
-    }
-
-    private static func convertWithAVAsset(inputURL: URL, outputURL: URL, completion: @escaping (Error?) -> Void) {
         let asset = AVURLAsset(url: inputURL)
         let outputSettings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
@@ -896,70 +1136,73 @@ final class SwiftWhisperProvider: TranscriptionProvider {
             AVLinearPCMIsNonInterleaved: false,
         ]
 
-        guard let reader = try? AVAssetReader(asset: asset) else {
-            completion(NSError(domain: "SwiftWhisperProvider", code: 1,
-                               userInfo: [NSLocalizedDescriptionKey: "無法讀取音訊檔案"]))
-            return
+        let tracks = try await asset.loadTracks(withMediaType: .audio)
+        guard let track = tracks.first else {
+            throw NSError(domain: "SwiftWhisperProvider", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "音訊檔案沒有音軌"])
         }
 
-        guard let track = asset.tracks(withMediaType: .audio).first else {
-            completion(NSError(domain: "SwiftWhisperProvider", code: 1,
-                               userInfo: [NSLocalizedDescriptionKey: "音訊檔案沒有音軌"]))
-            return
-        }
-
+        let reader = try AVAssetReader(asset: asset)
         let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: outputSettings)
         reader.add(readerOutput)
 
-        guard let writer = try? AVAssetWriter(outputURL: outputURL, fileType: .wav) else {
-            completion(NSError(domain: "SwiftWhisperProvider", code: 1,
-                               userInfo: [NSLocalizedDescriptionKey: "無法建立 WAV 寫入器"]))
-            return
-        }
-
+        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .wav)
         let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: outputSettings)
         writer.add(writerInput)
 
         reader.startReading()
 
-        // Check if reader actually started
         guard reader.status == .reading else {
             let desc = reader.error?.localizedDescription ?? "未知錯誤"
-            completion(NSError(domain: "SwiftWhisperProvider", code: 1,
-                               userInfo: [NSLocalizedDescriptionKey: "無法讀取音訊：\(desc)"]))
-            return
+            throw NSError(domain: "SwiftWhisperProvider", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "無法讀取音訊：\(desc)"])
         }
 
         writer.startWriting()
         writer.startSession(atSourceTime: .zero)
 
-        writerInput.requestMediaDataWhenReady(on: DispatchQueue(label: "wav-convert")) {
-            while writerInput.isReadyForMoreMediaData {
-                // Check reader status before calling copyNextSampleBuffer
-                // to avoid ObjC exception crash when reader is in failed/cancelled state
-                guard reader.status == .reading else {
-                    writerInput.markAsFinished()
-                    if reader.status == .failed {
-                        writer.cancelWriting()
-                        let desc = reader.error?.localizedDescription ?? "音訊讀取失敗"
-                        completion(NSError(domain: "SwiftWhisperProvider", code: 1,
-                                           userInfo: [NSLocalizedDescriptionKey: desc]))
-                    } else {
-                        writer.finishWriting {
-                            completion(writer.error)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            // All AV objects are used exclusively on the serial "wav-convert"
+            // queue below — safe to send across isolation boundaries.
+            let ctx = UncheckedSendableBox((reader, writer, writerInput, readerOutput))
+            writerInput.requestMediaDataWhenReady(on: DispatchQueue(label: "wav-convert")) {
+                let (reader, writer, writerInput, readerOutput) = ctx.value
+                while writerInput.isReadyForMoreMediaData {
+                    // Check reader status before calling copyNextSampleBuffer
+                    // to avoid ObjC exception crash when reader is in failed/cancelled state
+                    guard reader.status == .reading else {
+                        writerInput.markAsFinished()
+                        if reader.status == .failed {
+                            writer.cancelWriting()
+                            let desc = reader.error?.localizedDescription ?? "音訊讀取失敗"
+                            continuation.resume(throwing: NSError(
+                                domain: "SwiftWhisperProvider", code: 1,
+                                userInfo: [NSLocalizedDescriptionKey: desc]))
+                        } else {
+                            writer.finishWriting {
+                                if let err = writer.error {
+                                    continuation.resume(throwing: err)
+                                } else {
+                                    continuation.resume()
+                                }
+                            }
                         }
+                        return
                     }
-                    return
-                }
 
-                if let buffer = readerOutput.copyNextSampleBuffer() {
-                    writerInput.append(buffer)
-                } else {
-                    writerInput.markAsFinished()
-                    writer.finishWriting {
-                        completion(writer.error)
+                    if let buffer = readerOutput.copyNextSampleBuffer() {
+                        writerInput.append(buffer)
+                    } else {
+                        writerInput.markAsFinished()
+                        writer.finishWriting {
+                            if let err = writer.error {
+                                continuation.resume(throwing: err)
+                            } else {
+                                continuation.resume()
+                            }
+                        }
+                        return
                     }
-                    return
                 }
             }
         }
@@ -970,6 +1213,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         token: String,
         speakers: Int,
         segments: [HeadlessSegment],
+        processRegistry: ActiveProcessRegistry,
         log: @escaping @Sendable (String) -> Void
     ) async throws -> [HeadlessSegment] {
         // Convert audio to WAV using AVFoundation (no ffmpeg needed)
@@ -1035,7 +1279,9 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 }
 
                 try process.run()
+                await processRegistry.register(pid: process.processIdentifier, for: .diarization)
                 process.waitUntilExit()
+                await processRegistry.clear(.diarization, matching: process.processIdentifier)
                 stderrHandle.readabilityHandler = nil
 
                 let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
@@ -1074,6 +1320,75 @@ private final class StderrCollector: @unchecked Sendable {
         defer { lock.unlock() }
         return buffer
     }
+
+    func tail(maxLines: Int) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        let lines = buffer
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+        return lines.suffix(maxLines).joined(separator: "\n")
+    }
+}
+
+private enum ControlAction: Equatable {
+    case pause
+    case sleepPause
+    case stop
+    case shutdown
+}
+
+private actor ActiveProcessRegistry {
+    enum Stage: CaseIterable {
+        case enhancement
+        case headless
+        case diarization
+    }
+
+    private var pids: [Stage: Int32] = [:]
+
+    func register(pid: Int32, for stage: Stage) {
+        guard pid > 0 else { return }
+        pids[stage] = pid
+    }
+
+    func clear(_ stage: Stage, matching pid: Int32? = nil) {
+        if let pid {
+            guard pids[stage] == pid else { return }
+        }
+        pids.removeValue(forKey: stage)
+    }
+
+    func terminateAll() async {
+        let activePIDs = pids.values
+        pids.removeAll()
+        for pid in activePIDs where pid > 0 {
+            await terminate(pid: pid)
+        }
+    }
+
+    private func terminate(pid: Int32) async {
+        if kill(pid, 0) != 0 { return }
+        kill(pid, SIGINT)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        if kill(pid, 0) == 0 {
+            kill(pid, SIGTERM)
+        }
+        for _ in 0..<10 {
+            if kill(pid, 0) != 0 { return }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        if kill(pid, 0) == 0 {
+            kill(pid, SIGKILL)
+        }
+    }
+}
+
+/// Wrapper to send non-Sendable values across isolation boundaries
+/// when the caller guarantees exclusive access (e.g. serial queue).
+private struct UncheckedSendableBox<T>: @unchecked Sendable {
+    let value: T
+    init(_ value: T) { self.value = value }
 }
 
 private enum HeadlessStreamEvent {
@@ -1112,6 +1427,7 @@ private final class StreamCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer = Data()
     private var result: HeadlessResult?
+    private var history: [String] = []
 
     func append(_ data: Data) -> [String] {
         lock.withLock {
@@ -1142,13 +1458,26 @@ private final class StreamCollector: @unchecked Sendable {
         while let newlineRange = buffer.firstRange(of: Data([0x0A])) {
             let lineData = buffer.subdata(in: 0..<newlineRange.lowerBound)
             buffer.removeSubrange(0...newlineRange.lowerBound)
-            lines.append(String(decoding: lineData, as: UTF8.self))
+            let line = String(decoding: lineData, as: UTF8.self)
+            lines.append(line)
+            history.append(line)
         }
         if includePartial, !buffer.isEmpty {
-            lines.append(String(decoding: buffer, as: UTF8.self))
+            let line = String(decoding: buffer, as: UTF8.self)
+            lines.append(line)
+            history.append(line)
             buffer.removeAll()
         }
+        if history.count > 24 {
+            history.removeFirst(history.count - 24)
+        }
         return lines
+    }
+
+    func tail(maxLines: Int) -> String {
+        lock.withLock {
+            history.suffix(maxLines).joined(separator: "\n")
+        }
     }
 }
 

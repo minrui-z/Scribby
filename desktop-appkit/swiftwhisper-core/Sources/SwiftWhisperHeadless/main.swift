@@ -9,13 +9,11 @@ struct SwiftWhisperHeadlessCLI {
             let request = try resolveRequest(arguments: CommandLine.arguments)
             let core = SwiftWhisperCore()
             _ = try await core.transcribeStreaming(request) { event in
-                Task {
-                    await writer.write(event)
-                }
+                writer.write(event)
             }
         } catch {
             let message = error.localizedDescription.isEmpty ? String(describing: error) : error.localizedDescription
-            await writer.write(.failed(message))
+            writer.write(.failed(message))
             FileHandle.standardError.write(Data("SwiftWhisper headless failed: \(message)\n".utf8))
             exit(1)
         }
@@ -39,19 +37,40 @@ struct SwiftWhisperHeadlessCLI {
     }
 }
 
-actor EventStreamWriter {
+final class EventStreamWriter: @unchecked Sendable {
     private let encoder: JSONEncoder = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         return encoder
     }()
+    private let lock = NSLock()
 
     func write(_ event: SwiftWhisperEvent) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        switch event {
+        case .completed:
+            FileHandle.standardError.write(Data("swiftwhisper: emitting completed event\n".utf8))
+        case .failed:
+            FileHandle.standardError.write(Data("swiftwhisper: emitting failed event\n".utf8))
+        default:
+            break
+        }
+
         do {
             let envelope = SwiftWhisperEventEnvelope(event: event)
             let data = try encoder.encode(envelope)
             FileHandle.standardOutput.write(data)
             FileHandle.standardOutput.write(Data("\n".utf8))
+            switch event {
+            case .completed:
+                FileHandle.standardError.write(Data("swiftwhisper: completed event flushed\n".utf8))
+            case .failed:
+                FileHandle.standardError.write(Data("swiftwhisper: failed event flushed\n".utf8))
+            default:
+                break
+            }
         } catch {
             let message = error.localizedDescription.isEmpty ? String(describing: error) : error.localizedDescription
             FileHandle.standardError.write(Data("SwiftWhisper stream encode failed: \(message)\n".utf8))

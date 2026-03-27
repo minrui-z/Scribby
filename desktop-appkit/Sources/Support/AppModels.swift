@@ -75,6 +75,7 @@ struct DownloadProgress: Equatable {
 struct QueueItemModel: Identifiable, Equatable {
     let id: String
     let fileId: String
+    var sourcePath: String
     var filename: String
     var size: Int64
     var status: String

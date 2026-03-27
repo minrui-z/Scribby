@@ -200,6 +200,7 @@ final class PythonBackendProvider: TranscriptionProvider {
         return QueueItemModel(
             id: id,
             fileId: fileId,
+            sourcePath: dict["path"] as? String ?? dict["sourcePath"] as? String ?? "",
             filename: dict["filename"] as? String ?? dict["name"] as? String ?? "未知檔案",
             size: Int64(dict["size"] as? Int ?? 0),
             status: dict["status"] as? String ?? "pending",
