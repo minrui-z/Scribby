@@ -93,6 +93,19 @@ actor PythonEnvironmentManager {
     private var readyGroups: Set<PythonDependencyGroup> = []
     private var activeProcessID: Int32?
 
+    /// Minimum Python version required (mlx needs >=3.10).
+    private static let minimumPythonVersion = (major: 3, minor: 10)
+
+    /// python-build-standalone release to download when no suitable system Python is found.
+    private static let standalonePythonVersion = "3.12.8"
+    private static let standalonePythonRelease = "20241219"
+    private static let standalonePythonURL: URL = {
+        let base = "https://github.com/indygreg/python-build-standalone/releases/download"
+        let tag = "\(standalonePythonRelease)"
+        let file = "cpython-\(standalonePythonVersion)+\(standalonePythonRelease)-aarch64-apple-darwin-install_only.tar.gz"
+        return URL(string: "\(base)/\(tag)/\(file)")!
+    }()
+
     private var venvDirectory: URL {
         get throws {
             try PathResolver.appSupportDirectory()
@@ -110,6 +123,20 @@ actor PythonEnvironmentManager {
         get throws {
             try PathResolver.appSupportDirectory()
                 .appendingPathComponent(EnvironmentManifest.fileName, isDirectory: false)
+        }
+    }
+
+    private var standalonePythonDirectory: URL {
+        get throws {
+            try PathResolver.appSupportDirectory()
+                .appendingPathComponent("python-standalone", isDirectory: true)
+        }
+    }
+
+    private var standalonePythonExecutable: URL {
+        get throws {
+            try standalonePythonDirectory
+                .appendingPathComponent("python/bin/python3", isDirectory: false)
         }
     }
 
@@ -259,95 +286,118 @@ actor PythonEnvironmentManager {
     }
 
     private func findSystemPython(log: @escaping @Sendable (String) -> Void) async throws -> URL {
+        // 1. Check previously downloaded standalone Python
+        if let standalone = try? standalonePythonExecutable,
+           FileManager.default.isExecutableFile(atPath: standalone.path) {
+            return standalone
+        }
+
+        // 2. Check system Python (>=3.10 only)
         if let found = locateExistingPython() {
             return found
         }
 
-        // No Python found — install via Xcode Command Line Tools
-        log("正在安裝環境...")
-        try await installCommandLineTools(log: log)
-
-        // After installation, check again
-        if let found = locateExistingPython() {
-            return found
-        }
-
-        throw ResolverError.missingPath("環境安裝未完成，請完成系統彈出的安裝視窗後重試")
+        // 3. Download standalone Python
+        log("找不到 Python ≥ 3.10，正在下載獨立 Python 環境...")
+        return try await downloadStandalonePython(log: log)
     }
 
     private func locateExistingPython() -> URL? {
         let candidates = [
             "/opt/homebrew/bin/python3",
+            "/opt/homebrew/bin/python3.13",
             "/opt/homebrew/bin/python3.12",
             "/opt/homebrew/bin/python3.11",
+            "/opt/homebrew/bin/python3.10",
             "/usr/local/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
             "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
             "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
             "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
             "/usr/bin/python3",
         ]
         for path in candidates {
-            if FileManager.default.isExecutableFile(atPath: path) {
-                // /usr/bin/python3 is a shim — verify it actually works
-                if path == "/usr/bin/python3" {
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: path)
-                    process.arguments = ["--version"]
-                    process.standardOutput = FileHandle.nullDevice
-                    process.standardError = FileHandle.nullDevice
-                    do {
-                        try process.run()
-                        process.waitUntilExit()
-                        if process.terminationStatus != 0 { continue }
-                    } catch {
-                        continue
-                    }
-                }
-                return URL(fileURLWithPath: path)
+            guard FileManager.default.isExecutableFile(atPath: path) else { continue }
+
+            // Verify it runs and meets version requirement
+            guard let version = pythonVersion(python: URL(fileURLWithPath: path)),
+                  Self.meetsMinimumVersion(version) else {
+                continue
             }
+            return URL(fileURLWithPath: path)
         }
         return nil
     }
 
-    private func installCommandLineTools(log: @escaping @Sendable (String) -> Void) async throws {
-        // Trigger the macOS install dialog
-        let trigger = Process()
-        trigger.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
-        trigger.arguments = ["--install"]
-        trigger.standardOutput = FileHandle.nullDevice
-        trigger.standardError = FileHandle.nullDevice
-        try trigger.run()
-        trigger.waitUntilExit()
+    /// Check if a version string like "3.12.3" meets the minimum requirement.
+    private static func meetsMinimumVersion(_ version: String) -> Bool {
+        let parts = version.split(separator: ".").compactMap { Int($0) }
+        guard parts.count >= 2 else { return false }
+        if parts[0] > minimumPythonVersion.major { return true }
+        if parts[0] == minimumPythonVersion.major && parts[1] >= minimumPythonVersion.minor { return true }
+        return false
+    }
 
-        log("正在安裝環境，請稍候...")
+    /// Download python-build-standalone and extract to App Support.
+    private func downloadStandalonePython(log: @escaping @Sendable (String) -> Void) async throws -> URL {
+        let destDir = try standalonePythonDirectory
+        let executable = try standalonePythonExecutable
 
-        // Poll until python3 becomes available (or timeout after 10 minutes)
-        let deadline = Date().addingTimeInterval(600)
-        while Date() < deadline {
-            try await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds
+        // Clean up any previous partial download
+        if FileManager.default.fileExists(atPath: destDir.path) {
+            try FileManager.default.removeItem(at: destDir)
+        }
+        try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
 
-            // Check if CLT installation finished
-            let check = Process()
-            check.executableURL = URL(fileURLWithPath: "/usr/bin/xcode-select")
-            check.arguments = ["-p"]
-            check.standardOutput = FileHandle.nullDevice
-            check.standardError = FileHandle.nullDevice
-            do {
-                try check.run()
-                check.waitUntilExit()
-                if check.terminationStatus == 0 {
-                    // CLT installed, verify python3
-                    if locateExistingPython() != nil {
-                        log("環境安裝完成")
-                        return
-                    }
-                }
-            } catch {
-                continue
-            }
+        let tarPath = destDir.appendingPathComponent("python.tar.gz")
+
+        // Download
+        log("正在下載 Python \(Self.standalonePythonVersion)...")
+        let downloadedURL = try await downloadFile(from: Self.standalonePythonURL, to: tarPath, log: log)
+
+        // Extract — the tarball contains a `python/` directory
+        log("正在解壓縮 Python...")
+        let extract = Process()
+        extract.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+        extract.arguments = ["xzf", downloadedURL.path, "-C", destDir.path]
+        extract.standardOutput = FileHandle.nullDevice
+        let extractStderr = Pipe()
+        extract.standardError = extractStderr
+
+        try extract.run()
+        activeProcessID = extract.processIdentifier
+        extract.waitUntilExit()
+        activeProcessID = nil
+
+        // Clean up tarball
+        try? FileManager.default.removeItem(at: downloadedURL)
+
+        guard extract.terminationStatus == 0 else {
+            let errText = String(data: extractStderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            try? FileManager.default.removeItem(at: destDir)
+            throw ResolverError.missingPath("Python 解壓縮失敗：\(errText)")
         }
 
-        throw ResolverError.missingPath("環境安裝逾時，請完成系統彈出的安裝視窗後重試")
+        guard FileManager.default.isExecutableFile(atPath: executable.path) else {
+            try? FileManager.default.removeItem(at: destDir)
+            throw ResolverError.missingPath("Python 解壓縮後找不到執行檔")
+        }
+
+        log("Python \(Self.standalonePythonVersion) 安裝完成")
+        return executable
+    }
+
+    /// Download a file with progress reporting.
+    private func downloadFile(
+        from url: URL,
+        to destination: URL,
+        log: @escaping @Sendable (String) -> Void
+    ) async throws -> URL {
+        try await withCheckedThrowingContinuation { continuation in
+            let delegate = FileDownloadDelegate(destination: destination, log: log, continuation: continuation)
+            let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+            session.downloadTask(with: url).resume()
+        }
     }
 
     /// Check that the group's packages are importable AND at the expected version.
@@ -650,5 +700,76 @@ private final class StderrCollector: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return buffer
+    }
+}
+
+/// URLSession delegate for downloading standalone Python with progress.
+private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {
+    private let destination: URL
+    private let log: @Sendable (String) -> Void
+    private let continuation: CheckedContinuation<URL, Error>
+    private var resumed = false
+    private var lastLogTime: TimeInterval = 0
+
+    init(
+        destination: URL,
+        log: @escaping @Sendable (String) -> Void,
+        continuation: CheckedContinuation<URL, Error>
+    ) {
+        self.destination = destination
+        self.log = log
+        self.continuation = continuation
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastLogTime >= 1.0 else { return }
+        lastLogTime = now
+
+        if totalBytesExpectedToWrite > 0 {
+            let pct = Int(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) * 100)
+            let mb = Double(totalBytesWritten) / 1_000_000
+            let totalMB = Double(totalBytesExpectedToWrite) / 1_000_000
+            log(String(format: "下載中… %.1f / %.1f MB (%d%%)", mb, totalMB, pct))
+        } else {
+            let mb = Double(totalBytesWritten) / 1_000_000
+            log(String(format: "下載中… %.1f MB", mb))
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        guard !resumed else { return }
+        resumed = true
+
+        do {
+            try? FileManager.default.removeItem(at: destination)
+            try FileManager.default.moveItem(at: location, to: destination)
+            continuation.resume(returning: destination)
+        } catch {
+            continuation.resume(throwing: ResolverError.missingPath("Python 下載搬移失敗：\(error.localizedDescription)"))
+        }
+        session.finishTasksAndInvalidate()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard !resumed else { return }
+        resumed = true
+
+        if let error {
+            continuation.resume(throwing: ResolverError.missingPath("Python 下載失敗：\(error.localizedDescription)"))
+        } else if let http = task.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            continuation.resume(throwing: ResolverError.missingPath("Python 下載失敗：HTTP \(http.statusCode)"))
+        }
+        session.finishTasksAndInvalidate()
     }
 }

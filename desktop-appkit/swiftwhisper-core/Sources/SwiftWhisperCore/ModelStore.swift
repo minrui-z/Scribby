@@ -11,11 +11,11 @@ public actor ModelStore {
                   !environmentPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             self.baseDirectory = URL(fileURLWithPath: environmentPath, isDirectory: true)
         } else {
-            self.baseDirectory = URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .deletingLastPathComponent()
-                .appendingPathComponent(".models", isDirectory: true)
+            // Fallback: use ~/Library/Application Support/com.minrui.scribby/swiftwhisper-models
+            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            self.baseDirectory = appSupport
+                .appendingPathComponent("com.minrui.scribby", isDirectory: true)
+                .appendingPathComponent("swiftwhisper-models", isDirectory: true)
         }
     }
 

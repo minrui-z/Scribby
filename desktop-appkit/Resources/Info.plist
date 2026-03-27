@@ -8,6 +8,8 @@
   <string>逐字搞定 Beta</string>
   <key>CFBundleExecutable</key>
   <string>ScribbyNative</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>com.minrui.scribby</string>
   <key>CFBundleInfoDictionaryVersion</key>

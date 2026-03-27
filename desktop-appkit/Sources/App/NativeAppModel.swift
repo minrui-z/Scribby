@@ -136,6 +136,13 @@ final class NativeAppModel: ObservableObject {
         }
     }
 
+    func openSettings() {
+        guard !showSettings else { return }
+        withAnimation(.linear(duration: 0.22)) {
+            showSettings = true
+        }
+    }
+
     func closeSettings() {
         withAnimation(.easeInOut(duration: 0.28)) {
             showSettings = false

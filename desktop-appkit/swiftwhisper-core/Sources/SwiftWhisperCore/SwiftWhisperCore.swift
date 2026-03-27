@@ -140,6 +140,7 @@ public enum SwiftWhisperCoreError: LocalizedError {
     case failedToCreateTempDirectory
     case modelDownloadFailed(String)
     case emptyTranscription
+    case invalidRequest(String)
 
     public var errorDescription: String? {
         switch self {
@@ -153,6 +154,8 @@ public enum SwiftWhisperCoreError: LocalizedError {
             return "SwiftWhisper 模型下載失敗：\(message)"
         case .emptyTranscription:
             return "SwiftWhisper 沒有產生任何可用文字"
+        case .invalidRequest(let message):
+            return message
         }
     }
 }

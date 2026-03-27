@@ -100,17 +100,17 @@ enum PathResolver {
     }
 
     static func pythonExecutable() throws -> URL {
-        // 1. Bundled runtime
-        if let bundled = Bundle.main.resourceURL?
-            .appendingPathComponent("desktop/runtime/python/bin/python3", isDirectory: false),
-           FileManager.default.isExecutableFile(atPath: bundled.path) {
-            return bundled
-        }
-
-        // 2. Managed venv (auto-created by PythonEnvironmentManager)
+        // 1. Managed venv (auto-created by PythonEnvironmentManager)
         if let managed = try? managedPythonVenv(),
            FileManager.default.isExecutableFile(atPath: managed.path) {
             return managed
+        }
+
+        // 2. Standalone Python (downloaded by PythonEnvironmentManager)
+        let standalone = try appSupportDirectory()
+            .appendingPathComponent("python-standalone/python/bin/python3", isDirectory: false)
+        if FileManager.default.isExecutableFile(atPath: standalone.path) {
+            return standalone
         }
 
         // 3. Dev-only: workspace venv
@@ -119,18 +119,17 @@ enum PathResolver {
             if FileManager.default.isExecutableFile(atPath: workspace.path) {
                 return workspace
             }
-            let repo = root.appendingPathComponent("venv/bin/python", isDirectory: false)
-            if FileManager.default.isExecutableFile(atPath: repo.path) {
-                return repo
-            }
         }
 
         // 4. System Python
         let systemFallbacks = [
             "/opt/homebrew/bin/python3",
+            "/opt/homebrew/bin/python3.13",
             "/opt/homebrew/bin/python3.12",
             "/opt/homebrew/bin/python3.11",
+            "/opt/homebrew/bin/python3.10",
             "/usr/local/bin/python3",
+            "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3",
             "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3",
             "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3",
             "/Library/Frameworks/Python.framework/Versions/3.10/bin/python3",
@@ -146,20 +145,6 @@ enum PathResolver {
     }
 
     // MARK: - Scripts
-
-    static func backendScript() throws -> URL {
-        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("desktop/python_backend.py"),
-           FileManager.default.fileExists(atPath: bundled.path) {
-            return bundled
-        }
-
-        if let dev = devRepoRoot()?.appendingPathComponent("desktop/python_backend.py", isDirectory: false),
-           FileManager.default.fileExists(atPath: dev.path) {
-            return dev
-        }
-
-        throw ResolverError.missingPath("找不到桌面版 backend 腳本")
-    }
 
     static func diarizationHelperScript() throws -> URL {
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("python/pyannote_diarize.py"),
@@ -190,15 +175,6 @@ enum PathResolver {
     }
 
     // MARK: - Binaries
-
-    static func desktopWorkingDirectory() -> URL {
-        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("desktop", isDirectory: true),
-           FileManager.default.fileExists(atPath: bundled.path) {
-            return bundled
-        }
-        return devRepoRoot()?.appendingPathComponent("desktop", isDirectory: true)
-            ?? Bundle.main.bundleURL
-    }
 
     static func swiftWhisperExecutable() throws -> URL {
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("bin/scribby-swiftwhisper-headless"),
@@ -284,23 +260,14 @@ enum PathResolver {
         pathEntries.append(env["PATH"] ?? "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         env["PATH"] = pathEntries.joined(separator: ":")
 
-        if let resourceURL = Bundle.main.resourceURL {
-            let pythonHome = resourceURL.appendingPathComponent("desktop/runtime/python", isDirectory: true)
-            if FileManager.default.fileExists(atPath: pythonHome.path) {
-                env["PYTHONHOME"] = pythonHome.path
-                env["PYTHONPATH"] = pythonHome.appendingPathComponent("lib/python3.10/site-packages").path
-                env["PYTHONNOUSERSITE"] = "1"
-            } else {
-                // Clear any inherited Python env vars that could break the managed venv
-                // (e.g. from Anaconda, Miniconda, pyenv, or other Python managers)
-                env.removeValue(forKey: "PYTHONHOME")
-                env.removeValue(forKey: "PYTHONPATH")
-                env.removeValue(forKey: "VIRTUAL_ENV")
-                env.removeValue(forKey: "CONDA_PREFIX")
-                env.removeValue(forKey: "CONDA_DEFAULT_ENV")
-                env["PYTHONNOUSERSITE"] = "1"
-            }
-        }
+        // Clear any inherited Python env vars that could break the managed venv
+        // (e.g. from Anaconda, Miniconda, pyenv, or other Python managers)
+        env.removeValue(forKey: "PYTHONHOME")
+        env.removeValue(forKey: "PYTHONPATH")
+        env.removeValue(forKey: "VIRTUAL_ENV")
+        env.removeValue(forKey: "CONDA_PREFIX")
+        env.removeValue(forKey: "CONDA_DEFAULT_ENV")
+        env["PYTHONNOUSERSITE"] = "1"
 
         return env
     }

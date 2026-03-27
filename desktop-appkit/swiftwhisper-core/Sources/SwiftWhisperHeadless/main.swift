@@ -20,20 +20,16 @@ struct SwiftWhisperHeadlessCLI {
     }
 
     private static func resolveRequest(arguments: [String]) throws -> SwiftWhisperRequest {
-        if arguments.count > 1 {
-            let language = arguments.count > 2 ? arguments[2] : "zh"
-            let diarize = arguments.dropFirst(3).contains("--diarize")
-            return SwiftWhisperRequest(
-                audioFileURL: URL(fileURLWithPath: arguments[1]),
-                languageCode: language,
-                diarize: diarize
-            )
+        guard arguments.count > 1 else {
+            throw SwiftWhisperCoreError.invalidRequest("用法：scribby-swiftwhisper-headless <audio_file> [language] [--diarize]")
         }
-
-        let defaultURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("../../testvocal.m4a")
-            .standardizedFileURL
-        return SwiftWhisperRequest(audioFileURL: defaultURL)
+        let language = arguments.count > 2 ? arguments[2] : "zh"
+        let diarize = arguments.dropFirst(3).contains("--diarize")
+        return SwiftWhisperRequest(
+            audioFileURL: URL(fileURLWithPath: arguments[1]),
+            languageCode: language,
+            diarize: diarize
+        )
     }
 }
 

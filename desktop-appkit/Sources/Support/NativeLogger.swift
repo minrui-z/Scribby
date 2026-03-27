@@ -1,7 +1,12 @@
 import Foundation
 
 enum NativeLogger {
-    private static let fileURL = URL(fileURLWithPath: "/tmp/scribby-native.log")
+    private static let fileURL: URL = {
+        if let appSupport = try? PathResolver.appSupportDirectory() {
+            return appSupport.appendingPathComponent("scribby-native.log")
+        }
+        return URL(fileURLWithPath: "/tmp/scribby-native.log")
+    }()
     private static let formatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
