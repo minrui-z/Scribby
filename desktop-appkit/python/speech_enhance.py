@@ -121,6 +121,17 @@ def enhance(
     orig_sr = model.config.sample_rate
     resampled = _resample(enhanced, orig_sr, TARGET_SR)
 
+    # RMS normalize — keep consistent loudness across different inputs
+    rms = np.sqrt(np.mean(resampled ** 2))
+    if rms > 0:
+        target_rms = 10 ** (-20.0 / 20)  # -20 dBFS
+        resampled = resampled * (target_rms / rms)
+
+    # Peak limit — prevent clipping
+    peak = np.max(np.abs(resampled))
+    if peak > 1.0:
+        resampled = resampled / peak * 0.99
+
     # Write 16 kHz mono WAV
     import soundfile as sf
 

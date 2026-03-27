@@ -16,15 +16,27 @@ final class NativeAppModel: ObservableObject {
     @Published var showSettings = false
     @Published var isDraggingFiles = false
     @Published var isFileImporterPresented = false
-    @Published var selectedLanguage: String = "auto"
-    @Published var diarizeEnabled = false
-    @Published var enhancementEnabled = false
-    @Published var speakers = 0
-    @Published var token = ""
+    @Published var selectedLanguage: String = "auto" {
+        didSet { UserDefaults.standard.set(selectedLanguage, forKey: "selectedLanguage") }
+    }
+    @Published var diarizeEnabled = false {
+        didSet { UserDefaults.standard.set(diarizeEnabled, forKey: "diarizeEnabled") }
+    }
+    @Published var enhancementEnabled = false {
+        didSet { UserDefaults.standard.set(enhancementEnabled, forKey: "enhancementEnabled") }
+    }
+    @Published var speakers = 0 {
+        didSet { UserDefaults.standard.set(speakers, forKey: "speakers") }
+    }
+    @Published var token = "" {
+        didSet { KeychainHelper.save(key: "huggingface-token", value: token) }
+    }
     @Published var tokenStatus = ""
     @Published var tokenStatusTone: StatusTone = .neutral
     @Published private(set) var providerInfo: ProviderInfo?
-    @Published var selectedModelPreset: WhisperModelPreset = .default
+    @Published var selectedModelPreset: WhisperModelPreset = .default {
+        didSet { UserDefaults.standard.set(selectedModelPreset.rawValue, forKey: "selectedModelPreset") }
+    }
 
     private var provider: TranscriptionProvider
     private let dialogs: DialogService
@@ -116,6 +128,7 @@ final class NativeAppModel: ObservableObject {
     func bootstrap() {
         NativeLogger.clear()
         NativeLogger.log("Native app bootstrap")
+        loadPersistedSettings()
         do {
             try provider.start()
             Task {
@@ -380,6 +393,24 @@ final class NativeAppModel: ObservableObject {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(body, forType: .string)
         statusCenter.setActionStatus("已複製逐字稿內容", tone: .success)
+    }
+
+    private func loadPersistedSettings() {
+        let defaults = UserDefaults.standard
+        if let lang = defaults.string(forKey: "selectedLanguage") {
+            selectedLanguage = lang
+        }
+        diarizeEnabled = defaults.bool(forKey: "diarizeEnabled")
+        enhancementEnabled = defaults.bool(forKey: "enhancementEnabled")
+        speakers = defaults.integer(forKey: "speakers")
+        if let savedToken = KeychainHelper.load(key: "huggingface-token"), !savedToken.isEmpty {
+            token = savedToken
+        }
+        if let presetRaw = defaults.string(forKey: "selectedModelPreset"),
+           let preset = WhisperModelPreset(rawValue: presetRaw),
+           preset != selectedModelPreset {
+            switchModel(to: preset)
+        }
     }
 
     private func enqueue(paths: [String], sourceLabel: String) async {

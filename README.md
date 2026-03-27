@@ -1,18 +1,20 @@
-# Scribby v0.5.1-beta
+# Scribby v0.5.2-beta
 
 macOS 原生語音轉文字工具，支援多語者辨識與人聲加強。
 
 ## 功能
 
-- **SwiftWhisper + Core ML** 轉寫，支援 Apple Neural Engine 加速
-- **多語者辨識**（需 HuggingFace token）
+- **SwiftWhisper + Core ML** 轉寫，支援 Apple Neural Engine 加速，99+ 語言自動偵測
+- **pyannote 多語者辨識**（需 HuggingFace token）
 - **MossFormer2 人聲加強**（MLX 加速）
+- 分段彩色進度條，即時顯示各處理階段
+- 下載資訊卡片，顯示模型下載進度與速度
+- 首次使用自動安裝 Python 環境與依賴套件
+- CoreML encoder 自動從 HuggingFace 下載
 
 ## 安裝
 
 從 [Releases](https://github.com/minrui-z/Scribby/releases) 下載最新版本，解壓後拖入 Applications。
-
-首次開啟可能需要到「系統設定 → 隱私權與安全性」允許執行。
 
 ## Repo 結構
 
@@ -33,6 +35,22 @@ cd desktop-appkit
 
 ## 系統需求
 
-- macOS 13+
-- Apple Silicon（M1 以上，Core ML / MLX 加速）
-- Python 3（首次使用時自動安裝）
+- macOS 13 (Ventura) 以上
+- Apple Silicon（M1 以上）— Intel Mac 不支援
+- 首次使用需要網路連線（自動下載 Whisper 模型，約 1.5~2.9 GB）
+
+## 首次開啟
+
+App 目前未經 Apple 公證，首次開啟時 macOS 會阻擋。請使用以下方式開啟：
+
+1. 在 Finder 中對 app 按右鍵（或 Control + 點擊）→ 選擇「打開」→ 再點「打開」
+2. 或在終端機執行：`xattr -cr /path/to/逐字搞定\ Beta.app`
+
+之後就可以正常雙擊開啟。
+
+## 注意事項
+
+- 語者辨識功能需要 [HuggingFace Token](https://huggingface.co/settings/tokens)，並在 pyannote 模型頁面完成授權
+- 人聲加強功能使用 MLX，僅支援 Apple Silicon
+- Python 環境會在首次使用語者辨識或人聲加強時自動建立（找不到系統 Python 時會自動下載獨立版本）
+- 部分少見音檔格式可能需要安裝 [ffmpeg](https://formulae.brew.sh/formula/ffmpeg)（`brew install ffmpeg`）

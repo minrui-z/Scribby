@@ -813,7 +813,7 @@ struct RootView: View {
     private var hoveredControlHintText: String? {
         switch hoveredControlHint {
         case .pause:
-            return "會暫停佇列，恢復後會重新開始目前檔案"
+            return "會在目前段落停下，恢復後從該段繼續"
         case .stop:
             return "會停止目前檔案，本次不會自動繼續"
         case .none:

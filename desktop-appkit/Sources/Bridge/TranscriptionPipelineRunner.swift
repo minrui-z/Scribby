@@ -2,6 +2,64 @@ import AVFoundation
 import Foundation
 
 enum TranscriptionPipelineRunner {
+    static func runChunkedHeadless(
+        filePath: String,
+        language: String,
+        modelPreset: WhisperModelPreset,
+        processSupervisor: ProcessSupervisor,
+        event: @escaping @Sendable (HeadlessStreamEvent) -> Void,
+        log: @escaping @Sendable (String) -> Void = { _ in },
+        downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void = { _, _, _ in }
+    ) async throws -> HeadlessResult {
+        let normalizedURL = try await AudioChunker.normalizeForASR(
+            inputPath: filePath,
+            processSupervisor: processSupervisor
+        )
+        defer { Task { await processSupervisor.cleanupTemporaryFile(normalizedURL) } }
+
+        let chunks = try await AudioChunker.createChunks(
+            from: normalizedURL,
+            processSupervisor: processSupervisor
+        )
+
+        var chunkResults: [ChunkTranscription] = []
+        chunkResults.reserveCapacity(chunks.count)
+
+        for chunk in chunks {
+            try Task.checkCancellation()
+            log("正在轉寫第 \(chunk.index + 1) / \(chunk.total) 段...")
+
+            let result = try await runHeadless(
+                filePath: chunk.url.path,
+                language: language,
+                diarize: false,
+                modelPreset: modelPreset,
+                processSupervisor: processSupervisor,
+                event: { streamEvent in
+                    switch streamEvent {
+                    case .progress(let progress):
+                        let overall = (Double(chunk.index) + progress) / Double(max(chunk.total, 1))
+                        event(.progress(overall))
+                    case .partial(let segments):
+                        event(.partial(segments))
+                    case .completed:
+                        break
+                    case .failed(let message):
+                        event(.failed(message))
+                    }
+                },
+                log: log,
+                downloadProgress: downloadProgress
+            )
+
+            chunkResults.append(ChunkTranscription(chunk: chunk, result: result))
+        }
+
+        let merged = try TranscriptChunkMerger.merge(chunkResults)
+        event(.completed(merged))
+        return merged
+    }
+
     static func runHeadless(
         filePath: String,
         language: String,
@@ -443,7 +501,7 @@ enum TranscriptionPipelineRunner {
         return (filename, downloaded, total)
     }
 
-    private static func convertToWAV(inputPath: String, outputPath: String) async throws {
+    static func convertToWAV(inputPath: String, outputPath: String) async throws {
         let inputURL = URL(fileURLWithPath: inputPath)
         let outputURL = URL(fileURLWithPath: outputPath)
         try? FileManager.default.removeItem(at: outputURL)
@@ -691,6 +749,7 @@ private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     private let destination: URL
     private let progressHandler: (Int64, Int64) -> Void
     private let continuation: CheckedContinuation<Void, Error>
+    private let lock = NSLock()
     private var resumed = false
     private var lastReportTime: TimeInterval = 0
 
@@ -709,8 +768,10 @@ private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        guard !resumed else { return }
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
         resumed = true
+        lock.unlock()
         do {
             if FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.removeItem(at: destination)
@@ -724,8 +785,10 @@ private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard !resumed else { return }
+        lock.lock()
+        guard !resumed else { lock.unlock(); return }
         resumed = true
+        lock.unlock()
         if let error {
             continuation.resume(throwing: error)
         } else if let http = task.response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
