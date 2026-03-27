@@ -547,7 +547,7 @@ struct RootView: View {
                 ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 22) {
 
-                VStack(alignment: .leading, spacing: 12) {
+                settingsCard {
                     Toggle(isOn: $model.diarizeEnabled) {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("啟用語者辨識")
@@ -561,34 +561,8 @@ struct RootView: View {
                     .toggleStyle(.switch)
                     .modifier(WindowDragBlocker(model: model))
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(18)
-                .background(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .fill(Color.white.opacity(0.32))
-                )
 
-                VStack(alignment: .leading, spacing: 12) {
-                    Toggle(isOn: $model.enhancementEnabled) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("啟用人聲加強（beta）")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(primaryInk)
-                            Text("轉譯前先降噪增清，適合嘈雜環境錄音。會增加前處理時間。")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(secondaryInk)
-                        }
-                    }
-                    .toggleStyle(.switch)
-                    .modifier(WindowDragBlocker(model: model))
-                }
-                .padding(18)
-                .background(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .fill(Color.white.opacity(0.32))
-                )
-
-                VStack(alignment: .leading, spacing: 10) {
+                settingsCard {
                     VStack(alignment: .leading, spacing: 6) {
                         Text("Hugging Face Token")
                             .font(.system(size: 14, weight: .semibold))
@@ -607,12 +581,21 @@ struct RootView: View {
                     .frame(height: 30)
                     .disabled(!model.diarizeEnabled)
 
-                    HStack(spacing: 10) {
+                    HStack(alignment: .center, spacing: 10) {
                         Button("驗證 Token") {
                             model.verifyToken()
                         }
                         .buttonStyle(SecondaryActionButtonStyle())
+                        .frame(width: 108)
                         .disabled(!model.diarizeEnabled || model.token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                        Button("取得 Token") {
+                            NSWorkspace.shared.open(tokenURL)
+                        }
+                        .buttonStyle(SecondaryActionButtonStyle())
+                        .frame(width: 108)
+
+                        Spacer(minLength: 0)
 
                         if model.tokenVerified {
                             Text("已驗證")
@@ -621,77 +604,21 @@ struct RootView: View {
                         }
                     }
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("先建立 Access Token，並確認 pyannote 模型頁面已完成授權。")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(secondaryInk)
-                            .fixedSize(horizontal: false, vertical: true)
-
-                        Button("取得 Token") {
-                            NSWorkspace.shared.open(tokenURL)
-                        }
-                        .buttonStyle(SecondaryActionButtonStyle())
-                    }
-                    .opacity(model.diarizeEnabled ? 1 : 0.58)
+                    Text("先建立 Access Token，並確認 pyannote 模型頁面已完成授權。")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(secondaryInk)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(18)
-                .background(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .fill(Color.white.opacity(0.32))
-                )
                 .opacity(model.diarizeEnabled ? 1 : 0.72)
                 .scaleEffect(model.diarizeEnabled ? 1 : 0.985)
                 .animation(.easeInOut(duration: 0.22), value: model.diarizeEnabled)
 
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("辨識語言")
+                settingsCard {
+                    Text("轉譯模型")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(primaryInk)
-                    Text("選擇音訊的語言，或讓模型自動偵測。")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(secondaryInk)
 
-                    let languageOptions: [(code: String, label: String)] = [
-                        ("auto", "自動偵測"),
-                        ("zh", "中文"),
-                        ("en", "English"),
-                        ("ja", "日本語"),
-                        ("ko", "한국어"),
-                        ("es", "Español"),
-                        ("fr", "Français"),
-                        ("de", "Deutsch"),
-                    ]
-                    ForEach(languageOptions, id: \.code) { option in
-                        Button {
-                            model.selectedLanguage = option.code
-                        } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: model.selectedLanguage == option.code ? "checkmark.circle.fill" : "circle")
-                                    .font(.system(size: 16))
-                                    .foregroundStyle(model.selectedLanguage == option.code ? Color.accentColor : secondaryInk)
-                                Text(option.label)
-                                    .font(.system(size: 13, weight: model.selectedLanguage == option.code ? .bold : .medium))
-                                    .foregroundStyle(primaryInk)
-                                Spacer()
-                            }
-                            .padding(.vertical, 4)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(model.isProcessing)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(18)
-                .background(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .fill(Color.white.opacity(0.32))
-                )
-
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("辨識模型")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(primaryInk)
                     Text("切換後首次使用會自動下載模型。")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(secondaryInk)
@@ -728,12 +655,60 @@ struct RootView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(18)
-                .background(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .fill(Color.white.opacity(0.24))
-                )
+
+                settingsCard {
+                    Text("轉譯語言")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(primaryInk)
+                    Text("選擇音訊的語言，或讓模型自動偵測。")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(secondaryInk)
+
+                    let languageOptions: [(code: String, label: String)] = [
+                        ("auto", "自動偵測"),
+                        ("zh", "中文"),
+                        ("en", "English"),
+                        ("ja", "日本語"),
+                        ("ko", "한국어"),
+                        ("es", "Español"),
+                        ("fr", "Français"),
+                        ("de", "Deutsch"),
+                    ]
+                    ForEach(languageOptions, id: \.code) { option in
+                        Button {
+                            model.selectedLanguage = option.code
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: model.selectedLanguage == option.code ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(model.selectedLanguage == option.code ? Color.accentColor : secondaryInk)
+                                Text(option.label)
+                                    .font(.system(size: 13, weight: model.selectedLanguage == option.code ? .bold : .medium))
+                                    .foregroundStyle(primaryInk)
+                                Spacer()
+                            }
+                            .padding(.vertical, 4)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.isProcessing)
+                    }
+                }
+
+                settingsCard {
+                    Toggle(isOn: $model.enhancementEnabled) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("啟用人聲加強（beta）")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(primaryInk)
+                            Text("轉譯前先降噪增清，適合嘈雜環境錄音。會增加前處理時間。")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundStyle(secondaryInk)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .modifier(WindowDragBlocker(model: model))
+                }
 
                 }
                 }
@@ -749,6 +724,21 @@ struct RootView: View {
             .shadow(color: Color(red: 0.28, green: 0.20, blue: 0.12).opacity(0.05), radius: 18, x: -4, y: 6)
         }
         .animation(.easeInOut(duration: 0.28), value: model.showSettings)
+    }
+
+    private func settingsCard<Content: View>(
+        tinted: Bool = true,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color.white.opacity(tinted ? 0.32 : 0.24))
+        )
     }
 
     private func loadDroppedPaths(from providers: [NSItemProvider]) {

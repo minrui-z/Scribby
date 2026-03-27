@@ -16,7 +16,7 @@ final class NativeAppModel: ObservableObject {
     @Published var showSettings = false
     @Published var isDraggingFiles = false
     @Published var isFileImporterPresented = false
-    @Published var selectedLanguage: String = "zh"
+    @Published var selectedLanguage: String = "auto"
     @Published var diarizeEnabled = false
     @Published var enhancementEnabled = false
     @Published var speakers = 0
