@@ -78,10 +78,10 @@ struct RootView: View {
 
                         VStack(alignment: .leading, spacing: 8) {
                             Text("逐字搞定 Beta")
-                                .font(.system(size: 48, weight: .regular))
+                                .font(.system(size: 36, weight: .regular))
                                 .tracking(-0.8)
                             Text("語音轉譯")
-                                .font(.system(size: 18, weight: .regular))
+                                .font(.system(size: 12, weight: .regular))
                                 .foregroundStyle(secondaryInk)
                         }
                     }
