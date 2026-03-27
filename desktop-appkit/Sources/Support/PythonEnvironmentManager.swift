@@ -46,7 +46,14 @@ enum PythonDependencyGroup: String, CaseIterable {
             f"want soundfile 0.13.1 got {version('soundfile')}"
             """
         case .diarization:
-            return "import pyannote.audio"
+            return """
+            from importlib.metadata import version; \
+            import torch; \
+            import pandas; \
+            import pyannote.audio; \
+            assert version('huggingface_hub') == '1.8.0', \
+            f"want huggingface_hub 1.8.0 got {version('huggingface_hub')}"
+            """
         case .proofreading:
             return """
             from importlib.metadata import version; \
@@ -69,8 +76,9 @@ enum PythonDependencyGroup: String, CaseIterable {
                 "huggingface_hub": "1.8.0",
             ]
         case .diarization:
-            // Diarization packages are not pinned to exact versions.
-            return [:]
+            return [
+                "huggingface_hub": "1.8.0",
+            ]
         case .proofreading:
             return [
                 "mlx-lm": "0.31.1",
@@ -101,6 +109,7 @@ struct PipDownloadInfo: Sendable {
 /// Persisted alongside `python-env/` to detect version drift or corruption.
 private struct EnvironmentManifest: Codable {
     var pythonVersion: String
+    var matrixVersion: Int?
     var groups: [String: [String: String]]  // group.rawValue → { package: version }
 
     static let fileName = "env-manifest.json"
@@ -112,8 +121,10 @@ actor PythonEnvironmentManager {
     private var readyGroups: Set<PythonDependencyGroup> = []
     private var activeProcessID: Int32?
 
-    /// Minimum Python version required (mlx needs >=3.10).
+    /// 產品主線固定收斂到 Python 3.12.x，避免不同 minor 版本漂移。
+    private static let preferredPythonVersion = (major: 3, minor: 12)
     private static let minimumPythonVersion = (major: 3, minor: 10)
+    private static let environmentMatrixVersion = 1
 
     /// python-build-standalone release to download when no suitable system Python is found.
     private static let standalonePythonVersion = "3.12.8"
@@ -200,8 +211,16 @@ actor PythonEnvironmentManager {
         // 1. Check if venv exists
         let venvExists = FileManager.default.fileExists(atPath: python.path)
 
+        if venvExists,
+           let currentVersion = pythonVersion(python: python),
+           !Self.matchesPreferredVersion(currentVersion) {
+            log("偵測到 Python 版本為 \(currentVersion)，正在重建到 3.12.x...")
+            try destroyVenv(at: venvDir)
+            readyGroups = []
+        }
+
         // 2. If venv exists, check manifest for version drift
-        if venvExists, let manifest = manifest {
+        if FileManager.default.fileExists(atPath: python.path), let manifest = manifest {
             let drifted = isManifestDrifted(manifest, for: group, python: python)
             if drifted {
                 log("偵測到環境版本不符，正在重建...")
@@ -307,17 +326,19 @@ actor PythonEnvironmentManager {
     private func findSystemPython(log: @escaping @Sendable (String) -> Void) async throws -> URL {
         // 1. Check previously downloaded standalone Python
         if let standalone = try? standalonePythonExecutable,
-           FileManager.default.isExecutableFile(atPath: standalone.path) {
+           FileManager.default.isExecutableFile(atPath: standalone.path),
+           let version = pythonVersion(python: standalone),
+           Self.matchesPreferredVersion(version) {
             return standalone
         }
 
-        // 2. Check system Python (>=3.10 only)
+        // 2. Check system Python (3.12.x only)
         if let found = locateExistingPython() {
             return found
         }
 
         // 3. Download standalone Python
-        log("找不到 Python ≥ 3.10，正在下載獨立 Python 環境...")
+        log("找不到 Python 3.12.x，正在下載獨立 Python 環境...")
         return try await downloadStandalonePython(log: log)
     }
 
@@ -325,14 +346,21 @@ actor PythonEnvironmentManager {
         for path in PathResolver.systemPythonCandidates {
             guard FileManager.default.isExecutableFile(atPath: path) else { continue }
 
-            // Verify it runs and meets version requirement
+            // Verify it runs and matches the preferred version policy.
             guard let version = pythonVersion(python: URL(fileURLWithPath: path)),
-                  Self.meetsMinimumVersion(version) else {
+                  Self.matchesPreferredVersion(version) else {
                 continue
             }
             return URL(fileURLWithPath: path)
         }
         return nil
+    }
+
+    /// Check if a version string like "3.12.3" matches the preferred runtime.
+    private static func matchesPreferredVersion(_ version: String) -> Bool {
+        let parts = version.split(separator: ".").compactMap { Int($0) }
+        guard parts.count >= 2 else { return false }
+        return parts[0] == preferredPythonVersion.major && parts[1] == preferredPythonVersion.minor
     }
 
     /// Check if a version string like "3.12.3" meets the minimum requirement.
@@ -443,9 +471,10 @@ actor PythonEnvironmentManager {
 
         // Record Python version
         manifest.pythonVersion = pythonVersion(python: python) ?? manifest.pythonVersion
+        manifest.matrixVersion = Self.environmentMatrixVersion
 
         // Record installed versions for this group
-        manifest.groups[group.rawValue] = group.expectedVersions
+        manifest.groups[group.rawValue] = installedVersions(for: group, python: python)
 
         let data = try JSONEncoder().encode(manifest)
         try data.write(to: url, options: .atomic)
@@ -456,11 +485,21 @@ actor PythonEnvironmentManager {
         for group: PythonDependencyGroup,
         python: URL
     ) -> Bool {
-        // Check Python major.minor hasn't changed
+        if manifest.matrixVersion != Self.environmentMatrixVersion {
+            return true
+        }
+
+        // Check Python major.minor hasn't changed and is still the preferred one.
         if let currentPy = pythonVersion(python: python) {
+            if !Self.matchesPreferredVersion(currentPy) {
+                return true
+            }
             let manifestMajorMinor = manifest.pythonVersion.components(separatedBy: ".").prefix(2).joined(separator: ".")
             let currentMajorMinor = currentPy.components(separatedBy: ".").prefix(2).joined(separator: ".")
             if !manifestMajorMinor.isEmpty, manifestMajorMinor != currentMajorMinor {
+                return true
+            }
+            if !manifest.pythonVersion.isEmpty, !Self.matchesPreferredVersion(manifest.pythonVersion) {
                 return true
             }
         }
@@ -480,6 +519,54 @@ actor PythonEnvironmentManager {
         }
 
         return false
+    }
+
+    private func installedVersions(for group: PythonDependencyGroup, python: URL) -> [String: String] {
+        let packageNames = group.packages.map { spec in
+            spec.split(separator: "=").first.map(String.init) ?? spec
+        }
+        let script = """
+        import json
+        from importlib.metadata import version, PackageNotFoundError
+        packages = \(pythonListLiteral(packageNames))
+        out = {}
+        for pkg in packages:
+            try:
+                out[pkg] = version(pkg)
+            except PackageNotFoundError:
+                pass
+        print(json.dumps(out, ensure_ascii=False))
+        """
+
+        let process = Process()
+        process.executableURL = python
+        process.arguments = ["-c", script]
+        process.environment = cleanEnvironment(python: python)
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return group.expectedVersions }
+            let data = stdout.fileHandleForReading.readDataToEndOfFile()
+            if let decoded = try? JSONDecoder().decode([String: String].self, from: data) {
+                return decoded
+            }
+        } catch {}
+
+        return group.expectedVersions
+    }
+
+    private func pythonListLiteral(_ values: [String]) -> String {
+        let quoted = values.map { value -> String in
+            let escaped = value
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(escaped)\""
+        }
+        return "[" + quoted.joined(separator: ", ") + "]"
     }
 
     private func destroyVenv(at directory: URL) throws {

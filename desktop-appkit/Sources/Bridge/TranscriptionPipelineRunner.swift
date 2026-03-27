@@ -13,13 +13,15 @@ enum TranscriptionPipelineRunner {
     ) async throws -> HeadlessResult {
         let normalizedURL = try await AudioChunker.normalizeForASR(
             inputPath: filePath,
-            processSupervisor: processSupervisor
+            processSupervisor: processSupervisor,
+            log: log
         )
         defer { Task { await processSupervisor.cleanupTemporaryFile(normalizedURL) } }
 
         let chunks = try await AudioChunker.createChunks(
             from: normalizedURL,
-            processSupervisor: processSupervisor
+            processSupervisor: processSupervisor,
+            log: log
         )
 
         var chunkResults: [ChunkTranscription] = []
@@ -53,9 +55,11 @@ enum TranscriptionPipelineRunner {
             )
 
             chunkResults.append(ChunkTranscription(chunk: chunk, result: result))
+            log("chunk \(chunk.index + 1) / \(chunk.total) 完成，segments=\(result.segments.count)")
         }
 
         let merged = try TranscriptChunkMerger.merge(chunkResults)
+        log("chunk 合併完成：\(chunkResults.count) 段 -> \(merged.segments.count) segments")
         event(.completed(merged))
         return merged
     }
@@ -75,6 +79,7 @@ enum TranscriptionPipelineRunner {
 
         return try await Task.detached(priority: .userInitiated) {
             let executable = try PathResolver.swiftWhisperExecutable()
+            log("headless 啟動：preset=\(modelPreset.rawValue) language=\(language) diarize=\(diarize) file=\((filePath as NSString).lastPathComponent)")
 
             let process = Process()
             process.executableURL = executable
@@ -153,6 +158,7 @@ enum TranscriptionPipelineRunner {
             await processSupervisor.register(pid: process.processIdentifier, for: .headless)
             process.waitUntilExit()
             await processSupervisor.clear(.headless, matching: process.processIdentifier)
+            log("headless 結束：exit=\(process.terminationStatus) file=\((filePath as NSString).lastPathComponent)")
 
             // Wait for EOF on both pipes — ensures all in-flight
             // readabilityHandler callbacks have finished processing
@@ -183,6 +189,7 @@ enum TranscriptionPipelineRunner {
             guard process.terminationStatus == 0 else {
                 let errText = collectedStderr.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 let message = errText.isEmpty ? "SwiftWhisper 轉譯失敗" : errText
+                log("headless 失敗：\(message)")
                 throw NSError(
                     domain: "SwiftWhisperProvider",
                     code: Int(process.terminationStatus),
@@ -193,6 +200,7 @@ enum TranscriptionPipelineRunner {
             guard let completedResult = streamCollector.completedResult() else {
                 let stderrTail = collectedStderr.tail(maxLines: 20)
                 let stdoutTail = streamCollector.tail(maxLines: 20)
+                log("headless 缺少最終結果：exit=0 file=\((filePath as NSString).lastPathComponent)")
                 throw NSError(
                     domain: "SwiftWhisperProvider",
                     code: 2,

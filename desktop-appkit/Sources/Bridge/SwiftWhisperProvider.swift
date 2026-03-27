@@ -72,6 +72,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     func setPaused(_ paused: Bool) async throws -> ProviderSnapshot {
         if paused {
             guard !snapshot.isPaused else { return snapshot }
+            DebugLogger.shared.write("[control] pause requested currentFileId=\(snapshot.currentFileId ?? "-")")
             QueueStateReducer.pauseRequested(snapshot: &snapshot)
             pendingControlAction = .pause
             syncInfo()
@@ -92,6 +93,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         guard let request = lastTranscriptionRequest else {
             throw QueueStateReducer.providerError("目前沒有可恢復的轉譯任務")
         }
+        DebugLogger.shared.write("[control] resume requested currentFileId=\(snapshot.currentFileId ?? "-")")
 
         QueueStateReducer.resumeRequested(snapshot: &snapshot)
         pendingControlAction = nil
@@ -109,6 +111,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     }
 
     func stopCurrent() async throws -> StopRequestResult {
+        DebugLogger.shared.write("[control] stop requested currentFileId=\(snapshot.currentFileId ?? "-")")
         let result = QueueStateReducer.stopRequested(snapshot: &snapshot)
         guard result.accepted else { return result }
 
@@ -273,13 +276,15 @@ final class SwiftWhisperProvider: TranscriptionProvider {
 
                     let prepared = try await AudioChunker.prepareChunkedTranscription(
                         inputPath: pipelineSourcePath,
-                        processSupervisor: processSupervisor
+                        processSupervisor: processSupervisor,
+                        log: { line in DebugLogger.shared.write("[chunk] \(line)") }
                     )
                     chunkState = ChunkedTaskState(
                         prepared: prepared,
                         diarizationRequested: request.diarize
                     )
                     chunkStates[item.fileId] = chunkState
+                    DebugLogger.shared.write("[chunk] prepared file=\(item.filename) total=\(prepared.chunks.count)")
                     if let tempURL = enhancedTempURL {
                         await processSupervisor.cleanupTemporaryFile(tempURL)
                         enhancedTempURL = nil
@@ -303,6 +308,9 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     try Task.checkCancellation()
 
                     let chunk = activeChunkState.prepared.chunks[activeChunkState.nextChunkIndex]
+                    DebugLogger.shared.write(
+                        "[chunk] start file=\(item.filename) index=\(chunk.index + 1)/\(chunk.total) nominal=\(chunk.nominalStartSeconds)-\(chunk.nominalEndSeconds) actual=\(chunk.actualStartSeconds)-\(chunk.actualEndSeconds)"
+                    )
                     let chunkMessage = chunkProgressMessage(for: activeChunkState)
                     snapshot.items[index].message = chunkMessage
                     snapshot.items[index].progress = chunkProgressValue(for: activeChunkState)
@@ -312,32 +320,38 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     onEvent?(.taskProgress(fileId: item.fileId, message: chunkMessage, progress: chunkProgressValue(for: activeChunkState)))
                     onEvent?(.queueUpdated(snapshot))
 
-                    let chunkResult = try await TranscriptionPipelineRunner.runHeadless(
-                        filePath: chunk.url.path,
-                        language: request.language,
-                        diarize: false,
-                        modelPreset: modelPreset,
-                        processSupervisor: processSupervisor,
-                        event: { [weak self] streamEvent in
-                            Task { @MainActor in
-                                guard let self else { return }
-                                self.handleStreamEvent(streamEvent, itemIndex: index, fileId: item.fileId, chunkState: activeChunkState)
-                            }
-                        },
-                        log: { line in DebugLogger.shared.write("[whisper] \(line)") },
-                        downloadProgress: { [weak self] filename, downloaded, total in
-                            Task { @MainActor in
-                                guard let self else { return }
-                                let info = Self.makeDownloadProgress(filename: filename, downloaded: downloaded, total: total)
-                                if !self.snapshot.items[index].activePhases.contains(.downloading) {
-                                    self.snapshot.items[index].activePhases.insert(.downloading, at: 0)
+                    let chunkResult: HeadlessResult
+                    do {
+                        chunkResult = try await TranscriptionPipelineRunner.runHeadless(
+                            filePath: chunk.url.path,
+                            language: request.language,
+                            diarize: false,
+                            modelPreset: modelPreset,
+                            processSupervisor: processSupervisor,
+                            event: { [weak self] streamEvent in
+                                Task { @MainActor in
+                                    guard let self else { return }
+                                    self.handleStreamEvent(streamEvent, itemIndex: index, fileId: item.fileId, chunkState: activeChunkState)
                                 }
-                                self.snapshot.items[index].phase = .downloading
-                                self.onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: .downloading, activePhases: self.snapshot.items[index].activePhases))
-                                self.onEvent?(.taskDownloadProgress(fileId: item.fileId, info: info))
+                            },
+                            log: { line in DebugLogger.shared.write("[whisper] \(line)") },
+                            downloadProgress: { [weak self] filename, downloaded, total in
+                                Task { @MainActor in
+                                    guard let self else { return }
+                                    let info = Self.makeDownloadProgress(filename: filename, downloaded: downloaded, total: total)
+                                    if !self.snapshot.items[index].activePhases.contains(.downloading) {
+                                        self.snapshot.items[index].activePhases.insert(.downloading, at: 0)
+                                    }
+                                    self.snapshot.items[index].phase = .downloading
+                                    self.onEvent?(.taskPhaseChanged(fileId: item.fileId, phase: .downloading, activePhases: self.snapshot.items[index].activePhases))
+                                    self.onEvent?(.taskDownloadProgress(fileId: item.fileId, info: info))
+                                }
                             }
-                        }
-                    )
+                        )
+                    } catch {
+                        DebugLogger.shared.write("[chunk] fail file=\(item.filename) index=\(chunk.index + 1)/\(chunk.total) error=\(error.localizedDescription)")
+                        throw error
+                    }
 
                     let transcription = ChunkTranscription(chunk: chunk, result: chunkResult)
                     activeChunkState.mergedSegments = TranscriptChunkMerger.append(
@@ -349,12 +363,16 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     activeChunkState.suggestedFilename = chunkResult.suggestedFilename
                     activeChunkState.modelName = chunkResult.modelName
                     chunkStates[item.fileId] = activeChunkState
+                    DebugLogger.shared.write(
+                        "[chunk] done file=\(item.filename) index=\(chunk.index + 1)/\(chunk.total) chunkSegments=\(chunkResult.segments.count) mergedSegments=\(activeChunkState.mergedSegments.count)"
+                    )
                 }
 
                 let mergedResult = activeChunkState.mergedAsrResult
                 guard let result = mergedResult else {
                     throw QueueStateReducer.providerError("無法合併 chunk 轉譯結果")
                 }
+                DebugLogger.shared.write("[chunk] merged file=\(item.filename) totalSegments=\(result.segments.count) language=\(result.language)")
 
                 let finalResult: HeadlessResult
                 if activeChunkState.diarizationRequested && !activeChunkState.diarizationCompleted {
@@ -374,6 +392,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     )
                     activeChunkState.diarizationCompleted = true
                     chunkStates[item.fileId] = activeChunkState
+                    DebugLogger.shared.write("[diarize] aligned file=\(item.filename) inputSegments=\(result.segments.count) outputSegments=\(diarizedSegments.count)")
                     finalResult = HeadlessResult(
                         text: result.text,
                         language: result.language,
@@ -449,11 +468,13 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     if action == .pause {
                         snapshot.isPaused = true
                         syncInfo()
+                        DebugLogger.shared.write("[control] paused file=\(item.filename) message=\(pauseMessage(for: snapshot.currentFileId))")
                         onEvent?(.queuePaused(pauseMessage(for: snapshot.currentFileId)))
                         onEvent?(.queueUpdated(snapshot))
                     } else if action == .sleepPause {
                         snapshot.isPaused = true
                         syncInfo()
+                        DebugLogger.shared.write("[control] sleep-pause file=\(item.filename)")
                         onEvent?(.queuePaused("系統即將睡眠，已自動暫停目前佇列"))
                         onEvent?(.queueUpdated(snapshot))
                     } else {

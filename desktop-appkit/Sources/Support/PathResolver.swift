@@ -137,14 +137,42 @@ enum PathResolver {
             }
         }
 
-        // 4. System Python
+        // 4. System Python（只接受 3.12.x）
         for path in systemPythonCandidates {
-            if FileManager.default.isExecutableFile(atPath: path) {
+            if FileManager.default.isExecutableFile(atPath: path),
+               let version = pythonVersion(at: path),
+               matchesPreferredPythonVersion(version) {
                 return URL(fileURLWithPath: path)
             }
         }
 
         throw ResolverError.missingPath("找不到 Python 環境")
+    }
+
+    private static func pythonVersion(at path: String) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["--version"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let text = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            return text
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "Python ", with: "")
+        } catch {
+            return nil
+        }
+    }
+
+    private static func matchesPreferredPythonVersion(_ version: String) -> Bool {
+        let parts = version.split(separator: ".").compactMap { Int($0) }
+        guard parts.count >= 2 else { return false }
+        return parts[0] == 3 && parts[1] == 12
     }
 
     // MARK: - Scripts

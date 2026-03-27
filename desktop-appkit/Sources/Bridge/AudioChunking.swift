@@ -23,7 +23,8 @@ enum AudioChunker {
 
     static func normalizeForASR(
         inputPath: String,
-        processSupervisor: ProcessSupervisor
+        processSupervisor: ProcessSupervisor,
+        log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws -> URL {
         let normalizedURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
@@ -31,6 +32,7 @@ enum AudioChunker {
         await processSupervisor.trackTemporaryFile(normalizedURL)
         do {
             try await TranscriptionPipelineRunner.convertToWAV(inputPath: inputPath, outputPath: normalizedURL.path)
+            log("標準化完成：\(normalizedURL.lastPathComponent)（16kHz mono WAV）")
             return normalizedURL
         } catch {
             await processSupervisor.cleanupTemporaryFile(normalizedURL)
@@ -42,7 +44,8 @@ enum AudioChunker {
         from normalizedWav: URL,
         processSupervisor: ProcessSupervisor,
         chunkDurationSeconds: Double = chunkDurationSeconds,
-        overlapSeconds: Double = overlapSeconds
+        overlapSeconds: Double = overlapSeconds,
+        log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws -> [AudioChunk] {
         let sourceFile = try AVAudioFile(forReading: normalizedWav)
         let format = sourceFile.processingFormat
@@ -98,8 +101,10 @@ enum AudioChunker {
                     nominalEndSeconds: nominal.end
                 )
             )
+            log("chunk \(index + 1)/\(total) nominal=\(formatTime(nominal.start))-\(formatTime(nominal.end)) actual=\(formatTime(actualStart))-\(formatTime(actualEnd))")
         }
 
+        log("chunk 準備完成：總共 \(total) 段，chunk=\(Int(chunkDurationSeconds))s overlap=\(String(format: "%.1f", overlapSeconds))s")
         return chunks
     }
 
@@ -107,19 +112,33 @@ enum AudioChunker {
         inputPath: String,
         processSupervisor: ProcessSupervisor,
         chunkDurationSeconds: Double = chunkDurationSeconds,
-        overlapSeconds: Double = overlapSeconds
+        overlapSeconds: Double = overlapSeconds,
+        log: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws -> PreparedChunkedTranscription {
         let normalizedAudioURL = try await normalizeForASR(
             inputPath: inputPath,
-            processSupervisor: processSupervisor
+            processSupervisor: processSupervisor,
+            log: log
         )
         let chunks = try await createChunks(
             from: normalizedAudioURL,
             processSupervisor: processSupervisor,
             chunkDurationSeconds: chunkDurationSeconds,
-            overlapSeconds: overlapSeconds
+            overlapSeconds: overlapSeconds,
+            log: log
         )
         return PreparedChunkedTranscription(normalizedAudioURL: normalizedAudioURL, chunks: chunks)
+    }
+
+    static let shorterFallbackChunkDurationSeconds: Double = 90
+
+    private static func formatTime(_ seconds: Double) -> String {
+        let totalMilliseconds = Int((seconds * 1000).rounded())
+        let totalSeconds = max(totalMilliseconds / 1000, 0)
+        let minutes = totalSeconds / 60
+        let remainingSeconds = totalSeconds % 60
+        let milliseconds = totalMilliseconds % 1000
+        return String(format: "%02d:%02d.%03d", minutes, remainingSeconds, milliseconds)
     }
 
     private static func writeChunk(
