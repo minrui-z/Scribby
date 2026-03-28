@@ -198,8 +198,62 @@ final class SwiftWhisperProvider: TranscriptionProvider {
               let result = item.result else {
             throw QueueStateReducer.providerError("找不到可儲存的逐字稿")
         }
-        let body = formattedTranscriptText(for: item.filename, result: result)
+        let exportTitle = result.aiSuggestedTitle ?? item.filename
+        let body = formattedTranscriptText(for: exportTitle, result: result)
         try body.write(to: URL(fileURLWithPath: destinationPath), atomically: true, encoding: .utf8)
+    }
+
+    func generateSummary(fileId: String) async throws -> ProviderSnapshot {
+        guard let index = snapshot.items.firstIndex(where: { $0.fileId == fileId }),
+              let result = snapshot.items[index].result else {
+            throw QueueStateReducer.providerError("找不到可生成摘要的結果")
+        }
+        guard result.aiReadableFeaturesAvailable else {
+            throw QueueStateReducer.providerError("只有可讀版整理的結果可生成摘要")
+        }
+        if let existing = result.aiSummary, !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return snapshot
+        }
+
+        snapshot.items[index].message = "正在生成摘要..."
+        syncInfo()
+        onEvent?(.taskProgress(fileId: fileId, message: "正在生成摘要...", progress: nil))
+        onEvent?(.queueUpdated(snapshot))
+
+        let headless = HeadlessResult(
+            text: result.text,
+            language: result.language ?? "auto",
+            count: result.count,
+            suggestedFilename: result.suggestedFilename,
+            aiSuggestedTitle: result.aiSuggestedTitle,
+            aiSummary: result.aiSummary,
+            aiReadableFeaturesAvailable: true,
+            segments: result.segments.map {
+                HeadlessSegment(
+                    startTimeMs: $0.startTimeMs,
+                    endTimeMs: $0.endTimeMs,
+                    text: $0.text,
+                    speakerLabel: $0.speakerLabel
+                )
+            },
+            modelName: info.model
+        )
+
+        let metadata = try await TranscriptionPipelineRunner.runProofreadingMetadata(
+            result: headless,
+            processSupervisor: processSupervisor,
+            log: { line in DebugLogger.shared.write("[proofread-meta] \(line)") }
+        )
+
+        snapshot.items[index].result?.aiSummary = metadata.summary?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let generatedTitle = sanitizedDisplayTitle(from: metadata.title),
+           !(generatedTitle.isEmpty) {
+            snapshot.items[index].result?.aiSuggestedTitle = generatedTitle
+        }
+        snapshot.items[index].message = "摘要已就緒"
+        syncInfo()
+        onEvent?(.queueUpdated(snapshot))
+        return snapshot
     }
 
     private func startWorker(for request: TranscriptionRequest) {
@@ -443,6 +497,9 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                         language: result.language,
                         count: diarizedSegments.count,
                         suggestedFilename: result.suggestedFilename,
+                        aiSuggestedTitle: result.aiSuggestedTitle,
+                        aiSummary: result.aiSummary,
+                        aiReadableFeaturesAvailable: result.aiReadableFeaturesAvailable,
                         segments: diarizedSegments,
                         modelName: result.modelName
                     )
@@ -451,7 +508,7 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                 }
 
                 // AI 校稿（失敗時 fallback 到原始轉寫結果，不中斷流程）
-                let proofreadResult: HeadlessResult
+                var proofreadResult: HeadlessResult
                 if request.proofreadingMode != .off {
                     do {
                         try await PythonEnvironmentManager.shared.ensureReady(
@@ -514,6 +571,44 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                             }
                         )
                         DebugLogger.shared.write("[proofread] done segments=\(proofreadResult.segments.count)")
+                        if request.proofreadingMode == .readable {
+                            do {
+                                let metadata = try await TranscriptionPipelineRunner.runProofreadingMetadata(
+                                    result: proofreadResult,
+                                    processSupervisor: processSupervisor,
+                                    log: { line in DebugLogger.shared.write("[proofread-meta] \(line)") }
+                                )
+                                let generatedTitle = sanitizedDisplayTitle(from: metadata.title)
+                                let suggestedFilename = sanitizedSuggestedFilename(
+                                    from: generatedTitle,
+                                    fallback: proofreadResult.suggestedFilename
+                                )
+                                proofreadResult = HeadlessResult(
+                                    text: proofreadResult.text,
+                                    language: proofreadResult.language,
+                                    count: proofreadResult.count,
+                                    suggestedFilename: suggestedFilename,
+                                    aiSuggestedTitle: generatedTitle,
+                                    aiSummary: nil,
+                                    aiReadableFeaturesAvailable: true,
+                                    segments: proofreadResult.segments,
+                                    modelName: proofreadResult.modelName
+                                )
+                            } catch {
+                                DebugLogger.shared.write("[proofread-meta] ERROR: \(error.localizedDescription)")
+                                proofreadResult = HeadlessResult(
+                                    text: proofreadResult.text,
+                                    language: proofreadResult.language,
+                                    count: proofreadResult.count,
+                                    suggestedFilename: proofreadResult.suggestedFilename,
+                                    aiSuggestedTitle: proofreadResult.aiSuggestedTitle,
+                                    aiSummary: proofreadResult.aiSummary,
+                                    aiReadableFeaturesAvailable: true,
+                                    segments: proofreadResult.segments,
+                                    modelName: proofreadResult.modelName
+                                )
+                            }
+                        }
                     } catch {
                         let errMsg = "AI 校稿失敗，使用原始轉寫結果：\(error.localizedDescription)"
                         DebugLogger.shared.write("[proofread] ERROR: \(errMsg)")
@@ -860,6 +955,29 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         case .finished:
             return 99
         }
+    }
+
+    private func sanitizedDisplayTitle(from raw: String?) -> String? {
+        guard let raw else { return nil }
+        let invalid = CharacterSet(charactersIn: "\\/:*?\"<>|")
+        let cleaned = raw
+            .components(separatedBy: invalid)
+            .joined(separator: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+            .replacingOccurrences(of: #"[\[\]\(\)【】「」『』]+"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return nil }
+        return String(cleaned.prefix(40))
+    }
+
+    private func sanitizedSuggestedFilename(from title: String?, fallback: String) -> String {
+        guard let title, !title.isEmpty else { return fallback }
+        let fallbackURL = URL(fileURLWithPath: fallback)
+        let ext = fallbackURL.pathExtension.isEmpty ? "txt" : fallbackURL.pathExtension
+        return "\(title).\(ext)"
     }
 
     private func cleanupChunkState(for fileId: String) async {

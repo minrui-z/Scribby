@@ -9,6 +9,10 @@ struct RootView: View {
     private let primaryInk = Color(red: 0.16, green: 0.14, blue: 0.12)
     private let secondaryInk = Color(red: 0.34, green: 0.31, blue: 0.28)
     private let tokenURL = URL(string: "https://huggingface.co/settings/tokens")!
+    private let overlayCardTransition = AnyTransition.asymmetric(
+        insertion: .move(edge: .bottom).combined(with: .opacity).combined(with: .scale(scale: 0.96)),
+        removal: .opacity.combined(with: .scale(scale: 0.98))
+    )
 
     var body: some View {
         GeometryReader { proxy in
@@ -22,9 +26,25 @@ struct RootView: View {
                             lines: model.proofreadingStreamLines,
                             liveStatus: model.proofreadingLiveStatus
                         )
+                        .id("proofreading-stream")
                         .allowsHitTesting(false)
-                        .padding(.bottom, 108)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .padding(.bottom, 56)
+                        .transition(overlayCardTransition)
+                    } else if model.isTranscriptionStreaming {
+                        TranscriptionStreamOverlay(
+                            lines: model.transcriptionStreamLines,
+                            liveStatus: model.transcriptionLiveStatus
+                        )
+                        .id("transcription-stream-\(model.transcriptionStreamLines.last?.id.uuidString ?? "empty")")
+                        .allowsHitTesting(false)
+                        .padding(.bottom, 56)
+                        .transition(overlayCardTransition)
+                    } else if let activity = model.visibleActivityFeedback {
+                        ActivityFeedbackOverlay(state: activity)
+                            .id("activity-\(activity.kind.transitionKey)")
+                            .allowsHitTesting(false)
+                            .padding(.bottom, 56)
+                            .transition(overlayCardTransition)
                     } else {
                         LiveStreamOverlay(lines: model.floatingLines)
                             .allowsHitTesting(false)
@@ -34,6 +54,8 @@ struct RootView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .animation(.easeInOut(duration: 0.28), value: model.isProofreadingStreaming)
+                .animation(.easeInOut(duration: 0.28), value: model.isTranscriptionStreaming)
+                .animation(.easeInOut(duration: 0.28), value: model.visibleActivityFeedback != nil)
 
                 VStack(spacing: 26) {
                     header(availableWidth: proxy.size.width)
@@ -48,6 +70,7 @@ struct RootView: View {
 
                 if model.showSettings {
                     settingsOverlay
+                        .environment(\.colorScheme, .light)
                         .zIndex(3)
                         .transition(
                             .asymmetric(
@@ -63,9 +86,15 @@ struct RootView: View {
                         .transition(.opacity.combined(with: .scale(scale: 0.98)))
                 }
 
+                if let summaryPreview = model.summaryPreview {
+                    summaryPreviewOverlay(summaryPreview)
+                        .zIndex(5)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                }
+
                 if model.showOnboardingWizard {
                     onboardingWizardOverlay
-                        .zIndex(5)
+                        .zIndex(6)
                         .transition(.opacity.combined(with: .scale(scale: 0.98)))
                 }
             }
@@ -169,21 +198,34 @@ struct RootView: View {
     }
 
     private var listeningPill: some View {
-        HStack(spacing: 10) {
+        let glowColor = model.isPaused
+            ? Color(red: 0.89, green: 0.63, blue: 0.12)
+            : Color(red: 0.97, green: 0.35, blue: 0.31)
+        return HStack(spacing: 10) {
             Circle()
-                .fill(model.isPaused ? Color(red: 0.89, green: 0.63, blue: 0.12) : Color(red: 0.97, green: 0.35, blue: 0.31))
+                .fill(glowColor)
                 .frame(width: 10, height: 10)
                 .overlay(
                     Circle()
-                        .stroke((model.isPaused ? Color(red: 0.89, green: 0.63, blue: 0.12) : Color(red: 0.97, green: 0.35, blue: 0.31)).opacity(0.34), lineWidth: 4)
+                        .stroke(glowColor.opacity(0.34), lineWidth: 4)
                         .scaleEffect(1.15)
                 )
             Text(model.isPaused ? "已暫停" : "正在聆聽…")
                 .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(primaryInk)
         }
         .padding(.horizontal, 18)
         .frame(height: 52)
         .glassCard(cornerRadius: 999, strokeOpacity: 0.24)
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(glowColor.opacity(model.isPaused ? 0.20 : 0.32), lineWidth: 1.2)
+                .blur(radius: model.isPaused ? 10 : 14)
+                .scaleEffect(model.isPaused ? 1.02 : 1.06)
+        )
+        .shadow(color: glowColor.opacity(model.isPaused ? 0.14 : 0.26), radius: model.isPaused ? 10 : 18, x: 0, y: 0)
+        .modifier(BreathingGlowModifier(color: glowColor, active: !model.isPaused))
+        .environment(\.colorScheme, .light)
     }
 
     private var headerChrome: some View {
@@ -202,6 +244,7 @@ struct RootView: View {
             }
             .buttonStyle(GlassCapsuleButtonStyle())
         }
+        .environment(\.colorScheme, .light)
         .frame(height: model.showLiveHeader ? 56 : 86, alignment: .center)
         .fixedSize()
         .animation(.easeInOut(duration: 0.24), value: model.showCompactAddButton)
@@ -438,6 +481,7 @@ struct RootView: View {
                                 }
                             }
                             .buttonStyle(PrimaryActionButtonStyle(enabled: model.canResume))
+                            .modifier(StatusHaloModifier(color: Color(red: 0.14, green: 0.53, blue: 0.24), breathing: false))
                             .disabled(!model.canResume)
 
                             Button("清除全部") {
@@ -455,6 +499,7 @@ struct RootView: View {
                                 }
                             }
                             .buttonStyle(PrimaryActionButtonStyle(enabled: true))
+                            .modifier(StatusHaloModifier(color: Color(red: 0.89, green: 0.63, blue: 0.12), breathing: false))
                             .onHover { isHovering in
                                 withAnimation(.easeOut(duration: 0.16)) {
                                     hoveredControlHint = isHovering ? .pause : nil
@@ -465,6 +510,7 @@ struct RootView: View {
                                 model.stopCurrent()
                             }
                             .buttonStyle(SecondaryActionButtonStyle())
+                            .modifier(StatusHaloModifier(color: Color(red: 0.86, green: 0.29, blue: 0.25), breathing: false))
                             .foregroundStyle(secondaryInk)
                             .disabled(!model.supportsHardStop)
                             .onHover { isHovering in
@@ -481,6 +527,7 @@ struct RootView: View {
                                 }
                             }
                             .buttonStyle(PrimaryActionButtonStyle(enabled: model.canStart))
+                            .modifier(StatusHaloModifier(color: ProcessingPhase.transcribing.color, breathing: false))
                             .disabled(!model.canStart)
 
                             Button("清除全部") {
@@ -558,7 +605,9 @@ struct RootView: View {
                             cardHeight: resultCardHeight,
                             contentViewportHeight: resultContentHeight,
                             onCopy: { model.copyResult(for: item) },
-                            onSave: { model.saveResult(for: item) }
+                            onSave: { model.saveResult(for: item) },
+                            onSummary: { model.generateSummary(for: item) },
+                            isSummaryGenerating: model.summaryGeneratingFileId == item.fileId
                         )
                         .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
@@ -843,7 +892,12 @@ struct RootView: View {
                                 .foregroundStyle(secondaryInk)
                         }
 
-                        Text("桌面版本地執行，音訊不會離開您的電腦。轉譯、語者辨識、人聲加強與 AI 校稿都在本機完成；首次使用相關功能時，模型與執行環境會下載到 Application Support，Core ML encoder 也可能在本機編譯，不會打包進 app 本體。")
+                        Text("本地執行，音訊不會離開電腦。")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(secondaryInk)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text("模型與環境會下載到本機，不會打包進 app。")
                             .font(.system(size: 12, weight: .medium))
                             .foregroundStyle(secondaryInk)
                             .fixedSize(horizontal: false, vertical: true)
@@ -870,6 +924,77 @@ struct RootView: View {
         }
         .animation(.easeInOut(duration: 0.28), value: model.showSettings)
         .animation(.easeInOut(duration: 0.22), value: model.showModelManager)
+    }
+
+    private func summaryPreviewOverlay(_ preview: AISummaryPreviewModel) -> some View {
+        ZStack {
+            Color.black.opacity(0.16)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    model.closeSummaryPreview()
+                }
+
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(preview.title)
+                            .font(.system(size: 22, weight: .bold))
+                            .foregroundStyle(primaryInk)
+                        Text("AI 摘要")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    Spacer()
+                    Button("關閉") {
+                        model.closeSummaryPreview()
+                    }
+                    .buttonStyle(SecondaryActionButtonStyle())
+                }
+
+                ScrollView(.vertical, showsIndicators: true) {
+                    Text(preview.summary)
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(primaryInk)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(18)
+                }
+                .frame(height: 280)
+                .background(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(Color.white.opacity(0.42))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                .stroke(Color.white.opacity(0.52), lineWidth: 1)
+                        )
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+
+                HStack(spacing: 10) {
+                    Button("複製") {
+                        model.copySummaryPreview()
+                    }
+                    .buttonStyle(SecondaryActionButtonStyle())
+
+                    Button("下載") {
+                        model.saveSummaryPreview()
+                    }
+                    .buttonStyle(SecondaryActionButtonStyle())
+                    Spacer()
+                }
+            }
+            .padding(24)
+            .frame(width: 560)
+            .background(
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .fill(Color.white.opacity(0.90))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 28, style: .continuous)
+                            .stroke(Color.white.opacity(0.58), lineWidth: 1)
+                    )
+            )
+            .shadow(color: Color.black.opacity(0.12), radius: 28, x: 0, y: 14)
+        }
     }
 
     private var modelManagerOverlay: some View {
@@ -1041,17 +1166,17 @@ struct RootView: View {
     private func resolvedResultCardHeight(viewportHeight: CGFloat, itemCount: Int, cardSpacing: CGFloat) -> CGFloat {
         switch itemCount {
         case 1:
-            return max(min(viewportHeight - 8, 560), 400)
+            return max(min(viewportHeight - 4, 700), 480)
         case 2:
-            return max(min((viewportHeight - cardSpacing - 4) / 2, 296), 220)
+            return max(min((viewportHeight - cardSpacing) / 2, 356), 252)
         default:
-            return 248
+            return 282
         }
     }
 
     private func resolvedResultContentHeight(cardHeight: CGFloat) -> CGFloat {
-        let reservedChrome: CGFloat = 146
-        return max(min(cardHeight * 0.52, cardHeight - reservedChrome), 144)
+        let reservedChrome: CGFloat = 126
+        return max(min(cardHeight * 0.70, cardHeight - reservedChrome), 196)
     }
 
 }
@@ -1089,6 +1214,7 @@ private struct HoverHintBubble: View {
 private struct OnboardingWizardSheet: View {
     @ObservedObject var model: NativeAppModel
     let tokenURL: URL
+    @State private var onboardingSpinnerAnimating = false
 
     private let primaryInk = Color(red: 0.16, green: 0.14, blue: 0.12)
     private let secondaryInk = Color(red: 0.34, green: 0.31, blue: 0.28)
@@ -1583,9 +1709,28 @@ private struct OnboardingWizardSheet: View {
         let isCompleted = model.onboardingCompletedPreparationGroups.contains(key)
         let isActive = model.onboardingActivePreparationGroup == key && !isCompleted
         return HStack(alignment: .top, spacing: 12) {
-            Image(systemName: enabled ? (isCompleted ? "checkmark.circle.fill" : (isActive ? "arrow.triangle.2.circlepath.circle.fill" : "circle")) : "minus.circle")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(enabled ? (isCompleted ? Color(red: 0.14, green: 0.53, blue: 0.24) : (isActive ? Color.accentColor : secondaryInk.opacity(0.9))) : secondaryInk.opacity(0.8))
+            Group {
+                if !enabled {
+                    Image(systemName: "minus.circle")
+                } else if isCompleted {
+                    Image(systemName: "checkmark.circle.fill")
+                } else if isActive {
+                    Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                        .rotationEffect(.degrees(onboardingSpinnerAnimating ? 360 : 0))
+                        .animation(
+                            .linear(duration: 0.9).repeatForever(autoreverses: false),
+                            value: onboardingSpinnerAnimating
+                        )
+                } else {
+                    Image(systemName: "circle")
+                }
+            }
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(
+                enabled
+                    ? (isCompleted ? Color(red: 0.14, green: 0.53, blue: 0.24) : (isActive ? Color.accentColor : secondaryInk.opacity(0.9)))
+                    : secondaryInk.opacity(0.8)
+            )
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
                     .font(.system(size: 14, weight: .semibold))
@@ -1602,6 +1747,9 @@ private struct OnboardingWizardSheet: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color.white.opacity(enabled ? 0.34 : 0.18))
         )
+        .onAppear {
+            onboardingSpinnerAnimating = true
+        }
         .animation(.easeInOut(duration: 0.22), value: isCompleted)
         .animation(.easeInOut(duration: 0.22), value: isActive)
     }
@@ -1988,10 +2136,10 @@ private struct PulsingAddButton: View {
         .buttonStyle(FloatingIconButtonStyle())
         .overlay(
             Circle()
-                .stroke(Color.accentColor.opacity(glowing ? 0.24 : 0.04), lineWidth: 1.4)
+                .stroke(Color.white.opacity(glowing ? 0.42 : 0.10), lineWidth: 1.4)
                 .scaleEffect(glowing ? 1.16 : 0.92)
         )
-        .shadow(color: Color.accentColor.opacity(glowing ? 0.20 : 0.06), radius: glowing ? 14 : 6, x: 0, y: 0)
+        .shadow(color: Color.white.opacity(glowing ? 0.34 : 0.10), radius: glowing ? 18 : 8, x: 0, y: 0)
         .onAppear {
             withAnimation(.easeInOut(duration: 1.35).repeatForever(autoreverses: true)) {
                 glowing = true
@@ -2006,6 +2154,8 @@ private struct ResultCard: View {
     let contentViewportHeight: CGFloat
     let onCopy: () -> Void
     let onSave: () -> Void
+    let onSummary: () -> Void
+    let isSummaryGenerating: Bool
 
     private let cardPadding: CGFloat = 14
     private let stackSpacing: CGFloat = 8
@@ -2016,8 +2166,8 @@ private struct ResultCard: View {
             let availableHeight = proxy.size.height - (cardPadding * 2)
             let headerHeight = min(max(proxy.size.height * 0.10, 34), 42)
             let reserved = headerHeight + actionBarHeight + (stackSpacing * 2)
-            let preferredViewport = availableHeight * 0.47
-            let viewportHeight = max(min(contentViewportHeight, preferredViewport, availableHeight - reserved), 92)
+            let preferredViewport = availableHeight * 0.72
+            let viewportHeight = max(min(contentViewportHeight, preferredViewport, availableHeight - reserved), 148)
 
             VStack(alignment: .leading, spacing: stackSpacing) {
                 cardHeader(height: headerHeight)
@@ -2061,7 +2211,7 @@ private struct ResultCard: View {
     private func cardHeader(height: CGFloat) -> some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(item.filename)
+                Text(displayTitle)
                     .font(.system(size: 17, weight: .semibold))
             }
             Spacer()
@@ -2082,12 +2232,15 @@ private struct ResultCard: View {
                     segmentCard(index: index, segment: segment)
                 }
             }
-            .padding(2)
+            .padding(.horizontal, 2)
+            .padding(.top, 2)
+            .padding(.bottom, 14)
         }
         .frame(height: height)
         .padding(8)
         .background(resultViewportBackground)
         .overlay(resultViewportBorder)
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 
     private var resultViewportBackground: some View {
@@ -2111,6 +2264,21 @@ private struct ResultCard: View {
                 onSave()
             }
             .buttonStyle(SecondaryActionButtonStyle())
+
+            if item.result?.aiReadableFeaturesAvailable == true {
+                Button(action: onSummary) {
+                    HStack(spacing: 6) {
+                        if isSummaryGenerating {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(Color.accentColor)
+                        }
+                        Text(isSummaryGenerating ? "生成中" : "摘要")
+                    }
+                }
+                .buttonStyle(SecondaryActionButtonStyle())
+                .disabled(isSummaryGenerating)
+            }
             Spacer()
         }
         .frame(height: actionBarHeight, alignment: .leading)
@@ -2167,6 +2335,14 @@ private struct ResultCard: View {
         }
     }
 
+    private var displayTitle: String {
+        if let aiSuggestedTitle = item.result?.aiSuggestedTitle,
+           !aiSuggestedTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return aiSuggestedTitle
+        }
+        return item.filename
+    }
+
     private func formatTime(_ milliseconds: Int) -> String {
         let totalSeconds = max(milliseconds / 1000, 0)
         let minutes = totalSeconds / 60
@@ -2194,51 +2370,25 @@ private struct ProofreadingStreamOverlay: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(Color.accentColor.opacity(0.92))
-                    .frame(width: 8, height: 8)
-                    .overlay(
-                        Circle()
-                            .stroke(Color.accentColor.opacity(0.18), lineWidth: 6)
-                            .scaleEffect(1.2)
-                    )
-                Text("AI 校稿中")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(Color(red: 0.46, green: 0.42, blue: 0.38))
-                Spacer(minLength: 0)
-            }
+            cardHaloLine(color: Color.accentColor, label: "AI 校稿中", breathing: false)
 
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(lines.suffix(4).enumerated()), id: \.element.id) { index, line in
-                        Text(line.text)
-                            .font(.system(size: 13, weight: index == max(lines.suffix(4).count - 1, 0) ? .medium : .regular))
-                            .foregroundStyle(Color(red: 0.20, green: 0.18, blue: 0.15).opacity(index == max(lines.suffix(4).count - 1, 0) ? 0.92 : 0.62))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                        ProofreadingTypingLineView(
+                            text: line.text,
+                            emphasis: index == max(lines.suffix(4).count - 1, 0)
+                        )
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(height: 96)
-
-            if !liveStatus.isEmpty {
-                HStack(spacing: 6) {
-                    Text(liveStatus)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(Color(red: 0.16, green: 0.14, blue: 0.12))
-                        .lineLimit(1)
-                    BlinkingCursor()
-                    Spacer(minLength: 0)
-                }
-                .transition(.opacity)
-            }
+            .frame(height: 84)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
-        .frame(width: 420, height: 178, alignment: .topLeading)
+        .frame(width: 384, height: 160, alignment: .topLeading)
         .background(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .fill(Color.white.opacity(0.84))
@@ -2248,6 +2398,410 @@ private struct ProofreadingStreamOverlay: View {
                 )
         )
         .shadow(color: Color.black.opacity(0.06), radius: 14, x: 0, y: 8)
+        .animation(.spring(response: 0.34, dampingFraction: 0.84), value: lines.map(\.id))
+    }
+}
+
+private struct TranscriptionStreamOverlay: View {
+    let lines: [TranscriptionStreamLineModel]
+    let liveStatus: String
+
+    private let settledLinesLimit = 4
+    private var settledLines: [TranscriptionStreamLineModel] {
+        let trailingLines = Array(lines.suffix(settledLinesLimit + 1))
+        if let last = trailingLines.last, last.text == liveStatus, !liveStatus.isEmpty {
+            return Array(trailingLines.dropLast().suffix(settledLinesLimit))
+        }
+        return Array(trailingLines.suffix(settledLinesLimit))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            cardHaloLine(color: Color(red: 0.96, green: 0.62, blue: 0.04), label: "轉譯中", breathing: false)
+
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(settledLines.enumerated()), id: \.element.id) { index, line in
+                        SettlingTranscriptionLineView(
+                            text: line.text,
+                            emphasis: index == settledLines.count - 1
+                        )
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 74)
+
+            if !liveStatus.isEmpty {
+                IncomingTranscriptionLineView(text: liveStatus)
+                    .transition(.opacity)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .frame(width: 384, height: 160, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color.white.opacity(0.84))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(Color.white.opacity(0.55), lineWidth: 1)
+                )
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 14, x: 0, y: 8)
+        .animation(.spring(response: 0.34, dampingFraction: 0.84), value: lines.map(\.id))
+    }
+}
+
+private struct ActivityFeedbackOverlay: View {
+    let state: ActivityFeedbackState
+    @State private var spinning = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            cardHaloLine(color: tintColor, label: state.title, breathing: false)
+
+            switch state.kind {
+            case .enhancing:
+                EnhancementFeedbackView(color: tintColor)
+            case .diarizing:
+                DiarizationFeedbackView(color: tintColor)
+            default:
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.triangle.2.circlepath.circle.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(tintColor)
+                        .rotationEffect(.degrees(spinning ? 360 : 0))
+                        .animation(.linear(duration: 0.9).repeatForever(autoreverses: false), value: spinning)
+                    Spacer(minLength: 0)
+                }
+
+                if state.kind == .downloading, !state.detail.isEmpty {
+                    Text(state.detail)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Color(red: 0.34, green: 0.31, blue: 0.28))
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if let progress = state.progress {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ProgressView(value: progress, total: 1)
+                            .progressViewStyle(.linear)
+                            .tint(tintColor)
+                        Text("\(Int(progress * 100))%")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(tintColor)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .frame(width: 384, height: 160, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color.white.opacity(0.84))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(Color.white.opacity(0.55), lineWidth: 1)
+                )
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 14, x: 0, y: 8)
+        .onAppear {
+            spinning = true
+        }
+        .animation(.spring(response: 0.30, dampingFraction: 0.86), value: state.progress ?? 0)
+    }
+
+    private var tintColor: Color {
+        switch state.kind {
+        case .switchingModel:
+            return Color.accentColor
+        case .downloading:
+            return ProcessingPhase.downloading.color
+        case .enhancing:
+            return ProcessingPhase.enhancing.color
+        case .diarizing:
+            return ProcessingPhase.diarizing.color
+        case .preparing:
+            return Color.accentColor
+        }
+    }
+}
+
+private struct EnhancementFeedbackView: View {
+    let color: Color
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 36.0, paused: false)) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            let focus = 0.5 + 0.5 * sin(t * 0.72)
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(color.opacity(0.08))
+
+                AnimatedWaveShape(
+                    amplitude: CGFloat(8.5 - focus * 2.4),
+                    phase: t * 2.2,
+                    frequency: 1.55,
+                    verticalOffset: 40
+                )
+                .stroke(color.opacity(0.95), style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+
+                AnimatedWaveShape(
+                    amplitude: CGFloat(13.5 - focus * 4.2),
+                    phase: t * 2.7 + 0.9,
+                    frequency: 1.18,
+                    verticalOffset: 40
+                )
+                .stroke(color.opacity(0.22), style: StrokeStyle(lineWidth: 8, lineCap: .round, lineJoin: .round))
+                .blur(radius: 3)
+            }
+        }
+        .frame(height: 92)
+    }
+}
+
+private struct DiarizationFeedbackView: View {
+    let color: Color
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 36.0, paused: false)) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            let splitProgress = 0.5 + 0.5 * sin(t * 0.85)
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(color.opacity(0.08))
+
+                ForEach(Array(trackPalette.enumerated()), id: \.offset) { index, trackColor in
+                    let targetOffset = splitOffsets[index]
+                    AnimatedWaveShape(
+                        amplitude: 8,
+                        phase: t * 2.0 + Double(index) * 0.85,
+                        frequency: 1.25 + CGFloat(index) * 0.16,
+                        verticalOffset: 40 + targetOffset * splitProgress
+                    )
+                    .stroke(trackColor.opacity(0.88), style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+                    .blur(radius: index == 1 ? 0.2 : 0.5)
+                }
+            }
+        }
+        .frame(height: 92)
+    }
+
+    private var trackPalette: [Color] {
+        [
+            color,
+            Color(red: 0.20, green: 0.80, blue: 0.68),
+            Color(red: 0.14, green: 0.68, blue: 0.74)
+        ]
+    }
+
+    private var splitOffsets: [CGFloat] { [-15, 0, 15] }
+}
+
+private struct AnimatedWaveShape: Shape {
+    var amplitude: CGFloat
+    var phase: Double
+    var frequency: CGFloat
+    var verticalOffset: CGFloat
+
+    var animatableData: Double {
+        get { phase }
+        set { phase = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let width = rect.width
+        let baseline = max(8, min(rect.height - 8, verticalOffset))
+        path.move(to: CGPoint(x: 0, y: baseline))
+
+        let step = max(3, width / 56)
+        var x: CGFloat = 0
+        while x <= width {
+            let relative = x / width
+            let easedEnvelope = CGFloat(1 - pow(abs(relative - 0.5) * 2, 1.6))
+            let y = baseline + sin(relative * .pi * 2 * frequency + phase) * amplitude * max(0.18, easedEnvelope)
+            path.addLine(to: CGPoint(x: x, y: y))
+            x += step
+        }
+        return path
+    }
+}
+
+private struct BreathingGlowModifier: ViewModifier {
+    let color: Color
+    let active: Bool
+    @State private var glowing = false
+
+    func body(content: Content) -> some View {
+        content
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(color.opacity(active ? 0.26 : 0.14), lineWidth: 1.0)
+                    .blur(radius: active ? (glowing ? 16 : 8) : 8)
+                    .scaleEffect(active ? (glowing ? 1.08 : 1.01) : 1.02)
+                    .opacity(active ? (glowing ? 1 : 0.42) : 1)
+            )
+            .onAppear {
+                guard active else { return }
+                withAnimation(.easeInOut(duration: 1.3).repeatForever(autoreverses: true)) {
+                    glowing = true
+                }
+            }
+    }
+}
+
+private struct StatusHaloModifier: ViewModifier {
+    let color: Color
+    let breathing: Bool
+    @State private var glowing = false
+
+    func body(content: Content) -> some View {
+        content
+            .shadow(color: color.opacity(breathing ? 0.28 : 0.18), radius: breathing ? 16 : 10, x: 0, y: 0)
+            .overlay(
+                Capsule(style: .continuous)
+                    .stroke(color.opacity(breathing ? 0.28 : 0.18), lineWidth: 1.0)
+                    .blur(radius: breathing ? (glowing ? 14 : 7) : 8)
+                    .scaleEffect(breathing ? (glowing ? 1.08 : 1.02) : 1.03)
+                    .opacity(breathing ? (glowing ? 1 : 0.58) : 1)
+            )
+            .onAppear {
+                guard breathing else { return }
+                withAnimation(.easeInOut(duration: 1.25).repeatForever(autoreverses: true)) {
+                    glowing = true
+                }
+            }
+    }
+}
+
+private func cardHaloLine(color: Color, label: String, breathing: Bool) -> some View {
+    HStack(spacing: 10) {
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 999, style: .continuous)
+                .fill(color.opacity(0.18))
+                .frame(width: 52, height: 4)
+            Circle()
+                .fill(color.opacity(0.95))
+                .frame(width: 8, height: 8)
+                .shadow(color: color.opacity(breathing ? 0.30 : 0.16), radius: breathing ? 10 : 6, x: 0, y: 0)
+        }
+        Text(label)
+            .font(.system(size: 12, weight: .semibold))
+            .foregroundStyle(Color(red: 0.34, green: 0.31, blue: 0.28))
+            .lineLimit(1)
+        Spacer(minLength: 0)
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+}
+
+private struct SettlingTranscriptionLineView: View {
+    let text: String
+    let emphasis: Bool
+    @State private var settled = false
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: emphasis ? 13.5 : 13, weight: emphasis ? .medium : .regular))
+            .tracking(settled ? 0.1 : 4.4)
+            .foregroundStyle(Color(red: 0.20, green: 0.18, blue: 0.15).opacity(emphasis ? 0.88 : 0.62))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .blur(radius: settled ? 0 : 4.0)
+            .rotationEffect(.degrees(settled ? 0 : -3.2))
+            .offset(x: settled ? 0 : -24, y: settled ? 0 : 11)
+            .scaleEffect(settled ? 1 : 0.97, anchor: .leading)
+            .opacity(settled ? 1 : 0.22)
+            .onAppear {
+                withAnimation(.spring(response: 0.42, dampingFraction: 0.80)) {
+                    settled = true
+                }
+            }
+    }
+}
+
+private struct IncomingTranscriptionLineView: View {
+    let text: String
+    @State private var phase = 0
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            Text(text)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .tracking(phase == 0 ? 8.8 : 2.0)
+                .foregroundStyle(Color(red: 0.16, green: 0.14, blue: 0.12).opacity(0.16))
+                .offset(x: phase == 0 ? 34 : 8, y: phase == 0 ? 14 : 2)
+                .blur(radius: phase == 0 ? 7.0 : 1.6)
+
+            Text(text)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .tracking(phase == 0 ? 6.2 : 1.3)
+                .foregroundStyle(Color(red: 0.84, green: 0.58, blue: 0.16).opacity(phase == 0 ? 0.18 : 0.05))
+                .offset(x: phase == 0 ? -20 : -3, y: phase == 0 ? -6 : -1)
+                .blur(radius: phase == 0 ? 4.2 : 0.7)
+
+            Text(text)
+                .font(.system(size: 13, weight: .semibold, design: .rounded))
+                .tracking(phase == 0 ? 3.2 : 0.25)
+                .foregroundStyle(Color(red: 0.16, green: 0.14, blue: 0.12).opacity(phase == 0 ? 0.56 : 0.92))
+                .offset(x: phase == 0 ? -16 : 0, y: phase == 0 ? 8 : 0)
+                .blur(radius: phase == 0 ? 2.4 : 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+        .onAppear {
+            withAnimation(.easeOut(duration: 0.46)) {
+                phase = 1
+            }
+        }
+        .id(text)
+    }
+}
+
+private struct ProofreadingTypingLineView: View {
+    let text: String
+    let emphasis: Bool
+    @State private var visibleCount = 0
+    @State private var cursorVisible = true
+
+    private var characters: [Character] { Array(text) }
+    private var isTyping: Bool { visibleCount < characters.count }
+    private var typedText: String { String(characters.prefix(visibleCount)) }
+
+    var body: some View {
+        (
+            Text(typedText)
+                .foregroundColor(Color(red: 0.20, green: 0.18, blue: 0.15).opacity(emphasis ? 0.92 : 0.62))
+            +
+            Text(isTyping && cursorVisible ? "▋" : "")
+                .foregroundColor(Color.accentColor.opacity(0.92))
+        )
+            .font(.system(size: 13, weight: emphasis ? .medium : .regular))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .task(id: text) {
+                visibleCount = 0
+                if characters.isEmpty { return }
+                while visibleCount < characters.count {
+                    visibleCount = min(characters.count, visibleCount + 1)
+                    try? await Task.sleep(nanoseconds: 16_000_000)
+                }
+            }
+            .task(id: isTyping) {
+                cursorVisible = true
+                guard isTyping else { return }
+                while isTyping {
+                    try? await Task.sleep(nanoseconds: 420_000_000)
+                    cursorVisible.toggle()
+                }
+                cursorVisible = false
+            }
     }
 }
 

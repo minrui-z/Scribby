@@ -75,6 +75,15 @@ SYSTEM_PROMPT = (
     "9. 若某段文字語意完整、無明顯錯誤，保留原文即可，不必強行修改"
 )
 
+METADATA_PROMPT = (
+    "你是一位專業的逐字稿整理助手。\n"
+    "請根據整理後的逐字稿內容，產生一個精準、簡潔、適合作為檔名的中文標題，以及一份可閱讀的中文摘要。\n"
+    "標題需聚焦主旨，不要加入日期、格式標記、括號或副標。\n"
+    "摘要需忠於原文，不補充原文沒有的資訊。\n"
+    "輸出必須是合法 JSON："
+    "{\"title\":\"...\",\"summary\":\"...\"}"
+)
+
 
 def _log(msg: str) -> None:
     sys.stderr.write(msg + "\n")
@@ -230,6 +239,30 @@ def parse_response(response_text: str, batch_segs: list[dict], batch_start: int)
     return [{"id": f"{batch_start + j:03d}", "text": seg["text"]} for j, seg in enumerate(batch_segs)]
 
 
+def parse_metadata_response(response_text: str) -> dict:
+    _log(f"[DEBUG] metadata 原始輸出（前 400 字）：{response_text[:400]}")
+
+    candidates = [response_text]
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response_text, re.DOTALL)
+    if m:
+        candidates.append(m.group(1))
+    m = re.search(r"\{.*\}", response_text, re.DOTALL)
+    if m:
+        candidates.append(m.group(0))
+
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+            title = str(data.get("title", "")).strip()
+            summary = str(data.get("summary", "")).strip()
+            return {"title": title, "summary": summary}
+        except Exception:
+            continue
+
+    _log("警告：無法解析 metadata 回傳，返回空結果")
+    return {"title": "", "summary": ""}
+
+
 def proofread_batch(model, tokenizer, generate_fn, sampler, all_segs, batch_start, batch_end, mode, language: str = "zh", is_simplified: bool = False) -> list[str]:
     """回傳本批次校稿後的 text 清單，順序對應 batch_start..batch_end。"""
     batch_segs = all_segs[batch_start:batch_end]
@@ -277,6 +310,51 @@ def proofread_batch(model, tokenizer, generate_fn, sampler, all_segs, batch_star
     return result_texts
 
 
+def generate_metadata(model, tokenizer, generate_fn, sampler, segments: list[dict], language: str = "zh") -> dict:
+    transcript_text = "\n".join(seg.get("text", "").strip() for seg in segments if seg.get("text", "").strip())
+    if not transcript_text:
+        return {"title": "", "summary": ""}
+
+    lang_display = _LANGUAGE_NAMES.get(language, language)
+    prompt = (
+        f"【語言】輸入語言：{lang_display}\n\n"
+        "【逐字稿內容】\n"
+        f"{transcript_text}\n\n"
+        "請輸出 JSON："
+        "{\"title\":\"...\",\"summary\":\"...\"}"
+    )
+
+    messages = [
+        {"role": "system", "content": METADATA_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        formatted = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        combined = METADATA_PROMPT + "\n\n" + prompt
+        messages = [{"role": "user", "content": combined}]
+        formatted = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    response = generate_fn(
+        model,
+        tokenizer,
+        prompt=formatted,
+        max_tokens=512,
+        sampler=sampler,
+        verbose=False,
+    )
+    return parse_metadata_response(response)
+
+
 # ────────────────────────────────────────────────
 
 def main() -> None:
@@ -296,17 +374,27 @@ def main() -> None:
     segments: list[dict] = payload.get("segments", [])
     mode: str = payload.get("mode", "standard")
     language: str = payload.get("language", "zh")
+    action: str = payload.get("action", "proofread")
 
-    if mode not in MODE_INSTRUCTIONS:
+    if action == "proofread" and mode not in MODE_INSTRUCTIONS:
         _error(f"不支援的校稿模式：{mode}", code=1)
 
     if not segments:
-        # 沒有 segments，直接回傳空結果
-        sys.stdout.write(json.dumps({"segments": []}, ensure_ascii=False) + "\n")
+        if action == "metadata":
+            sys.stdout.write(json.dumps({"title": "", "summary": "", "readableFeaturesAvailable": True}, ensure_ascii=False) + "\n")
+        else:
+            sys.stdout.write(json.dumps({"segments": []}, ensure_ascii=False) + "\n")
         sys.stdout.flush()
         return
 
     model, tokenizer, generate_fn, sampler = load_model()
+
+    if action == "metadata":
+        metadata = generate_metadata(model, tokenizer, generate_fn, sampler, segments, language)
+        metadata["readableFeaturesAvailable"] = True
+        sys.stdout.write(json.dumps(metadata, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return
 
     # 語言偵測：language code 明確指定簡體，或文字內容含大量簡體字
     simplified_by_code = language in ("zh-CN", "zh_CN", "zhs", "zh-Hans")

@@ -734,6 +734,7 @@ enum TranscriptionPipelineRunner {
 
             let payload = ProofreadingPayload(
                 segments: result.segments,
+                action: "proofread",
                 mode: mode.rawValue,
                 language: proofreadingLanguage
             )
@@ -813,9 +814,93 @@ enum TranscriptionPipelineRunner {
                 language: proofreadingLanguage,
                 count: result.count,
                 suggestedFilename: result.suggestedFilename,
+                aiSuggestedTitle: proofreadResult.title,
+                aiSummary: proofreadResult.summary,
+                aiReadableFeaturesAvailable: proofreadResult.readableFeaturesAvailable ?? false,
                 segments: correctedSegments,
                 modelName: result.modelName
             )
+        }.value
+    }
+
+    static func runProofreadingMetadata(
+        result: HeadlessResult,
+        processSupervisor: ProcessSupervisor,
+        log: @escaping @Sendable (String) -> Void
+    ) async throws -> ProofreadingMetadataResult {
+        #if !arch(arm64)
+        throw NSError(
+            domain: "SwiftWhisperProvider",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "AI 校稿功能需要 Apple Silicon（M1 以上）"]
+        )
+        #endif
+
+        return try await Task.detached(priority: .userInitiated) {
+            let python = try PathResolver.pythonExecutable()
+            let helper = try PathResolver.proofreadingHelperScript()
+            let cacheDir = try await ModelCatalog.shared.llmModelCacheDirectory()
+            let language = resolvedProofreadingLanguage(for: result)
+            let payload = ProofreadingPayload(
+                segments: result.segments,
+                action: "metadata",
+                mode: nil,
+                language: language
+            )
+            let inputData = try JSONEncoder().encode(payload)
+
+            let process = Process()
+            process.executableURL = python
+            process.arguments = [helper.path]
+
+            var env = try PathResolver.backendEnvironment()
+            env["SCRIBBY_MLX_MODEL_CACHE"] = cacheDir.path
+            process.environment = env
+
+            let stdin = Pipe()
+            let stdout = Pipe()
+            let stderr = Pipe()
+            process.standardInput = stdin
+            process.standardOutput = stdout
+            process.standardError = stderr
+
+            let collectedStderr = StderrCollector()
+            let stderrHandle = stderr.fileHandleForReading
+            stderrHandle.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty else { return }
+                let text = String(decoding: data, as: UTF8.self)
+                collectedStderr.append(text)
+                for line in text.split(whereSeparator: \.isNewline) {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { continue }
+                    log(trimmed)
+                }
+            }
+
+            try process.run()
+            await processSupervisor.register(pid: process.processIdentifier, for: .proofreading)
+            stdin.fileHandleForWriting.write(inputData)
+            stdin.fileHandleForWriting.closeFile()
+
+            process.waitUntilExit()
+            await processSupervisor.clear(.proofreading, matching: process.processIdentifier)
+            stderrHandle.readabilityHandler = nil
+
+            let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()
+
+            guard process.terminationStatus == 0 else {
+                let errText = collectedStderr.tail(maxLines: 20)
+                throw NSError(
+                    domain: "SwiftWhisperProvider",
+                    code: Int(process.terminationStatus),
+                    userInfo: [NSLocalizedDescriptionKey: errText.isEmpty
+                        ? "AI 摘要生成失敗（exit \(process.terminationStatus)）"
+                        : errText]
+                )
+            }
+
+            return try JSONDecoder().decode(ProofreadingMetadataResult.self, from: stdoutData)
         }.value
     }
 
@@ -1781,8 +1866,58 @@ struct HeadlessResult: Codable {
     let language: String
     let count: Int
     let suggestedFilename: String
+    let aiSuggestedTitle: String?
+    let aiSummary: String?
+    let aiReadableFeaturesAvailable: Bool
     let segments: [HeadlessSegment]
     let modelName: String
+
+    enum CodingKeys: String, CodingKey {
+        case text
+        case language
+        case count
+        case suggestedFilename
+        case aiSuggestedTitle
+        case aiSummary
+        case aiReadableFeaturesAvailable
+        case segments
+        case modelName
+    }
+
+    init(
+        text: String,
+        language: String,
+        count: Int,
+        suggestedFilename: String,
+        aiSuggestedTitle: String?,
+        aiSummary: String?,
+        aiReadableFeaturesAvailable: Bool,
+        segments: [HeadlessSegment],
+        modelName: String
+    ) {
+        self.text = text
+        self.language = language
+        self.count = count
+        self.suggestedFilename = suggestedFilename
+        self.aiSuggestedTitle = aiSuggestedTitle
+        self.aiSummary = aiSummary
+        self.aiReadableFeaturesAvailable = aiReadableFeaturesAvailable
+        self.segments = segments
+        self.modelName = modelName
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        text = try container.decode(String.self, forKey: .text)
+        language = try container.decode(String.self, forKey: .language)
+        count = try container.decode(Int.self, forKey: .count)
+        suggestedFilename = try container.decode(String.self, forKey: .suggestedFilename)
+        aiSuggestedTitle = try container.decodeIfPresent(String.self, forKey: .aiSuggestedTitle)
+        aiSummary = try container.decodeIfPresent(String.self, forKey: .aiSummary)
+        aiReadableFeaturesAvailable = try container.decodeIfPresent(Bool.self, forKey: .aiReadableFeaturesAvailable) ?? false
+        segments = try container.decode([HeadlessSegment].self, forKey: .segments)
+        modelName = try container.decode(String.self, forKey: .modelName)
+    }
 }
 
 private struct DatasetsPayload: Codable {
@@ -1801,16 +1936,26 @@ private struct PyannoteResult: Codable {
 
 private struct ProofreadingPayload: Codable {
     let segments: [HeadlessSegment]
-    let mode: String
+    let action: String?
+    let mode: String?
     let language: String
 }
 
 private struct ProofreadingResult: Codable {
     let segments: [ProofreadingSegment]
+    let title: String?
+    let summary: String?
+    let readableFeaturesAvailable: Bool?
 }
 
 private struct ProofreadingSegment: Codable {
     let text: String
+}
+
+struct ProofreadingMetadataResult: Codable {
+    let title: String?
+    let summary: String?
+    let readableFeaturesAvailable: Bool?
 }
 
 private final class FileDownloadDelegate: NSObject, URLSessionDownloadDelegate {

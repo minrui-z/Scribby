@@ -20,6 +20,9 @@ struct TranscriptResult: Equatable {
     var count: Int
     var hasSpeakers: Bool
     var suggestedFilename: String
+    var aiSuggestedTitle: String?
+    var aiSummary: String?
+    var aiReadableFeaturesAvailable: Bool
     var segments: [TranscriptSegment]
 }
 
@@ -134,10 +137,48 @@ struct FloatingLineModel: Identifiable, Equatable {
     let delay: Double
 }
 
+enum ActivityFeedbackKind: Equatable {
+    case switchingModel
+    case downloading
+    case enhancing
+    case diarizing
+    case preparing
+
+    var transitionKey: String {
+        switch self {
+        case .switchingModel: return "switching-model"
+        case .downloading: return "downloading"
+        case .enhancing: return "enhancing"
+        case .diarizing: return "diarizing"
+        case .preparing: return "preparing"
+        }
+    }
+}
+
+struct ActivityFeedbackState: Equatable {
+    var kind: ActivityFeedbackKind
+    var title: String
+    var detail: String
+    var progress: Double?
+}
+
+struct TranscriptionStreamLineModel: Identifiable, Equatable {
+    let id = UUID()
+    let text: String
+    let createdAt = Date()
+}
+
 struct ProofreadingStreamLineModel: Identifiable, Equatable {
     let id = UUID()
     let text: String
     let createdAt = Date()
+}
+
+struct AISummaryPreviewModel: Equatable {
+    var fileId: String
+    var title: String
+    var summary: String
+    var suggestedFilename: String
 }
 
 struct ProviderSnapshot: Equatable {

@@ -220,6 +220,9 @@ enum TranscriptChunkMerger {
             language: first.result.language,
             count: mergedSegments.count,
             suggestedFilename: first.result.suggestedFilename,
+            aiSuggestedTitle: first.result.aiSuggestedTitle,
+            aiSummary: first.result.aiSummary,
+            aiReadableFeaturesAvailable: first.result.aiReadableFeaturesAvailable,
             segments: mergedSegments,
             modelName: first.result.modelName
         )
@@ -257,6 +260,9 @@ enum TranscriptChunkMerger {
             language: language,
             count: segments.count,
             suggestedFilename: suggestedFilename,
+            aiSuggestedTitle: nil,
+            aiSummary: nil,
+            aiReadableFeaturesAvailable: false,
             segments: segments,
             modelName: modelName
         )

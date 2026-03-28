@@ -154,12 +154,18 @@ enum QueueStateReducer {
                 : "SwiftWhisper 轉譯完成，但未取得語者標籤")
             : "SwiftWhisper 轉譯完成"
         snapshot.items[index].error = nil
+        snapshot.items[index].phase = nil
+        snapshot.items[index].activePhases = []
+        snapshot.items[index].downloadProgress = nil
         snapshot.items[index].result = TranscriptResult(
             text: result.text,
             language: result.language,
             count: result.count,
             hasSpeakers: hasSpeakers,
             suggestedFilename: result.suggestedFilename,
+            aiSuggestedTitle: result.aiSuggestedTitle,
+            aiSummary: result.aiSummary,
+            aiReadableFeaturesAvailable: result.aiReadableFeaturesAvailable,
             segments: mappedSegments
         )
     }

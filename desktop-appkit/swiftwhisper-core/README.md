@@ -1,46 +1,45 @@
 # Scribby SwiftWhisper Core
 
-這是 `desktop-appkit/` 內獨立的 headless SwiftWhisper 核心驗證區。
+這個資料夾不是單純的實驗區，而是 Scribby 目前實際使用的 headless ASR 核心。
 
-目前目標：
-- 預設使用 `ggml-tiny.bin`
-- 固定語言 `zh`
-- 不做 UI
-- 不做 diarization
-- 不做 HuggingFace token
-- 只驗證「純 Swift transcription 可行」
+它負責：
 
-主要結構：
-- `Package.swift`：獨立 SwiftPM package
-- `Sources/SwiftWhisperCore`：核心型別、模型快取、音訊解碼
-- `Sources/SwiftWhisperHeadless`：CLI 入口
-- `run-testvocal.sh`：直接用 repo root 的 `testvocal.m4a` 驗證
+- `scribby-swiftwhisper-headless`
+  - 供 app 在 chunked ASR 時呼叫
+- `scribby-coreml-diagnose`
+  - Core ML package / compile / load 的獨立診斷工具
 
-預期使用方式：
+## 主要結構
+
+- `Package.swift`
+  - SwiftPM package 定義
+- `Sources/SwiftWhisperCore`
+  - 核心型別、模型快取、音訊解碼
+- `Sources/SwiftWhisperHeadless`
+  - NDJSON headless CLI
+- `Sources/SwiftWhisperCoreMLDiagnose`
+  - Core ML load 診斷入口
+
+## 目前角色
+
+- app 端的 chunked ASR 會啟動 `scribby-swiftwhisper-headless`
+- `large-v3-turbo` / `large-v3` 的 Core ML encoder 驗證、fallback 與診斷都會經過這裡
+- `.wav` 輸入會優先走 direct WAV parse；非 WAV 才先試 `AVFoundation`，再 fallback 到 `ffmpeg`
+
+## 常見用途
 
 ```bash
 cd desktop-appkit/swiftwhisper-core
 swift build -c release
-./run-testvocal.sh
 ```
 
-目前已完成：
-- `SwiftWhisperCore`
-- `SwiftWhisperRequest`
-- `SwiftWhisperResult`
-- `ModelStore`
-- `AudioDecoder`
-- headless CLI 入口
-- `SwiftWhisper` 依賴已鎖定固定 revision
-- 模型配置已抽成 preset，可切換 `tiny / large-v3-turbo / large-v3`
-- `large-v3-turbo` / `large-v3` 已完成第一輪實測，但目前這版 `SwiftWhisper` 依賴鏈會在 128-mel 模型上失敗，尚不能直接升級為預設
+建出來的 binary 會放在：
 
-目前阻塞：
-- 這台機器的 Command Line Tools 缺少完整 libc++ headers
-- `swift build` 在編譯 `SwiftWhisper` 依賴的 `whisper.cpp` 時會卡在：
+- `.build/apple/Products/Release/scribby-swiftwhisper-headless`
+- `.build/apple/Products/Release/scribby-coreml-diagnose`
 
-```text
-fatal error: 'algorithm' file not found
-```
+## 注意
 
-這不是 `swiftwhisper-core` 本身的 Swift 程式碼錯誤，而是本機 C++ toolchain 不完整。
+- 這裡和 `desktop-appkit/` 主線是同一套產品的一部分，不要再把它當成舊的驗證沙盒
+- 若修改音訊解碼、模型載入、Core ML bridge 或 headless event 格式，必須同步更新：
+  - [../PROJECT_CONTEXT.md](../PROJECT_CONTEXT.md)

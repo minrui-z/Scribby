@@ -23,4 +23,5 @@ protocol TranscriptionProvider: AnyObject {
     func clearQueue() async throws -> ProviderSnapshot
     func removeQueueItem(fileId: String) async throws -> ProviderSnapshot
     func saveResult(fileId: String, destinationPath: String) async throws
+    func generateSummary(fileId: String) async throws -> ProviderSnapshot
 }

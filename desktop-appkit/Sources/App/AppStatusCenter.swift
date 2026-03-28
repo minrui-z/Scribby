@@ -10,7 +10,10 @@ final class AppStatusCenter: ObservableObject {
     @Published private(set) var actionStatus = ""
     @Published private(set) var actionStatusTone: StatusTone = .neutral
     @Published private(set) var diagnosticLogLines: [String] = []
+    @Published private(set) var activityFeedback: ActivityFeedbackState?
     @Published private(set) var floatingLines: [FloatingLineModel] = []
+    @Published private(set) var transcriptionStreamLines: [TranscriptionStreamLineModel] = []
+    @Published private(set) var transcriptionLiveStatus = ""
     @Published private(set) var proofreadingStreamLines: [ProofreadingStreamLineModel] = []
     @Published private(set) var proofreadingLiveStatus = ""
 
@@ -18,7 +21,9 @@ final class AppStatusCenter: ObservableObject {
     private var floatingDrainTask: Task<Void, Never>?
     private var lastFloatingMilestone = ""
     private var lastFloatingMilestoneAt = Date.distantPast
+    private var transcriptionClearTask: Task<Void, Never>?
     private var proofreadingClearTask: Task<Void, Never>?
+    private var transcriptionFragmentHistory: [String] = []
 
     var visibleActionStatus: String? {
         guard !actionStatus.isEmpty else { return nil }
@@ -51,6 +56,10 @@ final class AppStatusCenter: ObservableObject {
         !proofreadingLiveStatus.isEmpty || !proofreadingStreamLines.isEmpty
     }
 
+    var isTranscriptionStreaming: Bool {
+        !transcriptionLiveStatus.isEmpty || !transcriptionStreamLines.isEmpty
+    }
+
     func markReady() {
         setPickerStatus(Self.idleReadyMessage, tone: .success)
     }
@@ -69,6 +78,14 @@ final class AppStatusCenter: ObservableObject {
     func setActionStatus(_ message: String, tone: StatusTone) {
         actionStatus = message
         actionStatusTone = tone
+    }
+
+    func showActivityFeedback(_ state: ActivityFeedbackState) {
+        activityFeedback = state
+    }
+
+    func clearActivityFeedback() {
+        activityFeedback = nil
     }
 
     func appendDiagnosticLog(_ message: String) {
@@ -102,6 +119,8 @@ final class AppStatusCenter: ObservableObject {
     }
 
     func beginProofreadingStream(initialStatus: String = "正在 AI 校稿...") {
+        clearActivityFeedback()
+        clearTranscriptionStream()
         proofreadingClearTask?.cancel()
         if proofreadingLiveStatus.isEmpty && proofreadingStreamLines.isEmpty {
             proofreadingStreamLines = []
@@ -147,6 +166,73 @@ final class AppStatusCenter: ObservableObject {
         proofreadingStreamLines.removeAll()
     }
 
+    func beginTranscriptionStream(initialStatus: String = "正在整理語音內容...") {
+        clearActivityFeedback()
+        clearProofreadingStream()
+        transcriptionClearTask?.cancel()
+        transcriptionFragmentHistory.removeAll()
+        if transcriptionLiveStatus.isEmpty && transcriptionStreamLines.isEmpty {
+            transcriptionStreamLines = []
+        }
+        transcriptionLiveStatus = initialStatus
+    }
+
+    func updateTranscriptionLiveStatus(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        transcriptionClearTask?.cancel()
+        transcriptionLiveStatus = trimmed
+    }
+
+    func appendTranscriptionStreamLine(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        transcriptionClearTask?.cancel()
+        let fragments = transcriptionFragments(from: trimmed)
+        guard !fragments.isEmpty else { return }
+
+        let commonPrefixCount = zip(transcriptionFragmentHistory, fragments)
+            .prefix { $0 == $1 }
+            .count
+        let newFragments = Array(fragments.dropFirst(commonPrefixCount))
+
+        transcriptionFragmentHistory = fragments
+        transcriptionLiveStatus = fragments.last ?? trimmed
+
+        for fragment in newFragments {
+            if transcriptionStreamLines.last?.text != fragment {
+                transcriptionStreamLines.append(TranscriptionStreamLineModel(text: fragment))
+            }
+        }
+
+        while transcriptionStreamLines.count > 5 {
+            transcriptionStreamLines.removeFirst()
+        }
+    }
+
+    func finishTranscriptionStream(finalMessage: String? = nil) {
+        guard isTranscriptionStreaming else { return }
+        transcriptionClearTask?.cancel()
+        if let finalMessage {
+            appendTranscriptionStreamLine(finalMessage)
+        }
+        transcriptionLiveStatus = ""
+        transcriptionClearTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard let self else { return }
+            self.transcriptionStreamLines.removeAll()
+            self.transcriptionClearTask = nil
+        }
+    }
+
+    func clearTranscriptionStream() {
+        transcriptionClearTask?.cancel()
+        transcriptionClearTask = nil
+        transcriptionLiveStatus = ""
+        transcriptionFragmentHistory.removeAll()
+        transcriptionStreamLines.removeAll()
+    }
+
     func stopFloatingTranscript(clearVisible: Bool) {
         pendingFloatingFragments.removeAll()
         floatingDrainTask?.cancel()
@@ -162,6 +248,20 @@ final class AppStatusCenter: ObservableObject {
             .components(separatedBy: CharacterSet(charactersIn: "，。！？；、,.!?"))
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+    }
+
+    private func transcriptionFragments(from text: String) -> [String] {
+        let normalized = text.replacingOccurrences(of: "\n", with: " ")
+        let delimiters = CharacterSet(charactersIn: "。！？；.!?;\u{2026}")
+        let sentences = normalized
+            .components(separatedBy: delimiters)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        if !sentences.isEmpty {
+            return sentences
+        }
+        return [normalized.trimmingCharacters(in: .whitespacesAndNewlines)].filter { !$0.isEmpty }
     }
 
     private func startFloatingDrainLoop() {

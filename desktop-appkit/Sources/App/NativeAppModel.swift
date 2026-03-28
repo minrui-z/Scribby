@@ -80,6 +80,8 @@ final class NativeAppModel: ObservableObject {
     @Published var proofreadingMode: ProofreadingMode = .off {
         didSet { UserDefaults.standard.set(proofreadingMode.rawValue, forKey: "proofreadingMode") }
     }
+    @Published var summaryGeneratingFileId: String?
+    @Published var summaryPreview: AISummaryPreviewModel?
 
     private var provider: TranscriptionProvider
     private let dialogs: DialogService
@@ -99,6 +101,10 @@ final class NativeAppModel: ObservableObject {
     var actionStatusTone: StatusTone { statusCenter.actionStatusTone }
     var diagnosticLogLines: [String] { statusCenter.diagnosticLogLines }
     var floatingLines: [FloatingLineModel] { statusCenter.floatingLines }
+    var visibleActivityFeedback: ActivityFeedbackState? { statusCenter.activityFeedback }
+    var transcriptionStreamLines: [TranscriptionStreamLineModel] { statusCenter.transcriptionStreamLines }
+    var transcriptionLiveStatus: String { statusCenter.transcriptionLiveStatus }
+    var isTranscriptionStreaming: Bool { statusCenter.isTranscriptionStreaming }
     var proofreadingStreamLines: [ProofreadingStreamLineModel] { statusCenter.proofreadingStreamLines }
     var proofreadingLiveStatus: String { statusCenter.proofreadingLiveStatus }
     var isProofreadingStreaming: Bool { statusCenter.isProofreadingStreaming }
@@ -248,6 +254,24 @@ final class NativeAppModel: ObservableObject {
             return
         }
 
+        let pendingQueuePaths = queueItems
+            .filter { $0.status == .pending && $0.result == nil }
+            .map(\.sourcePath)
+        let canPreserveQueue = queueItems.isEmpty || pendingQueuePaths.count == queueItems.count
+
+        guard canPreserveQueue else {
+            statusCenter.setActionStatus("目前佇列包含已完成或特殊狀態項目，請先清除後再切換模型。", tone: .error)
+            return
+        }
+
+        statusCenter.showActivityFeedback(ActivityFeedbackState(
+            kind: .switchingModel,
+            title: "正在切換模型",
+            detail: pendingQueuePaths.isEmpty ? "正在套用新的轉譯模型..." : "正在更新轉譯模型與目前佇列...",
+            progress: nil
+        ))
+        statusCenter.setActionStatus("正在切換模型...", tone: .neutral)
+
         provider.shutdown()
         selectedModelPreset = preset
 
@@ -262,11 +286,26 @@ final class NativeAppModel: ObservableObject {
         do {
             try provider.start()
             Task {
-                let info = try await provider.getInfo()
-                providerInfo = info
-                statusCenter.setActionStatus("已切換到 \(preset.displayName)", tone: .success)
+                do {
+                    let info = try await provider.getInfo()
+                    providerInfo = info
+
+                    if pendingQueuePaths.isEmpty {
+                        applySnapshot(info.snapshot)
+                    } else {
+                        let snapshot = try await provider.enqueue(paths: pendingQueuePaths)
+                        applySnapshot(snapshot)
+                    }
+
+                    statusCenter.clearActivityFeedback()
+                    statusCenter.setActionStatus("已切換到 \(preset.displayName)", tone: .success)
+                } catch {
+                    statusCenter.clearActivityFeedback()
+                    statusCenter.setActionStatus("切換模型失敗: \(error.localizedDescription)", tone: .error)
+                }
             }
         } catch {
+            statusCenter.clearActivityFeedback()
             statusCenter.setActionStatus("切換模型失敗: \(error.localizedDescription)", tone: .error)
         }
     }
@@ -497,6 +536,65 @@ final class NativeAppModel: ObservableObject {
         statusCenter.setActionStatus("已複製逐字稿內容", tone: .success)
     }
 
+    func generateSummary(for item: QueueItemModel) {
+        guard item.result?.aiReadableFeaturesAvailable == true else { return }
+        guard summaryGeneratingFileId == nil else { return }
+
+        if let existing = item.result?.aiSummary,
+           !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            presentSummaryPreview(for: item, summary: existing)
+            return
+        }
+
+        summaryGeneratingFileId = item.fileId
+        statusCenter.clearProofreadingStream()
+        statusCenter.clearActivityFeedback()
+        statusCenter.setActionStatus("正在生成摘要", tone: .neutral)
+        Task {
+            do {
+                let snapshot = try await provider.generateSummary(fileId: item.fileId)
+                applySnapshot(snapshot)
+                summaryGeneratingFileId = nil
+                guard let refreshed = snapshot.items.first(where: { $0.fileId == item.fileId }),
+                      let summary = refreshed.result?.aiSummary,
+                      !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    statusCenter.setActionStatus("摘要生成失敗", tone: .error)
+                    return
+                }
+                presentSummaryPreview(for: refreshed, summary: summary)
+                statusCenter.setActionStatus("摘要已生成", tone: .success)
+            } catch {
+                summaryGeneratingFileId = nil
+                statusCenter.setActionStatus("摘要生成失敗: \(error.localizedDescription)", tone: .error)
+            }
+        }
+    }
+
+    func closeSummaryPreview() {
+        withAnimation(.easeInOut(duration: 0.22)) {
+            summaryPreview = nil
+        }
+    }
+
+    func copySummaryPreview() {
+        guard let summaryPreview else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(summaryPreview.summary, forType: .string)
+        statusCenter.setActionStatus("已複製 AI 摘要", tone: .success)
+    }
+
+    func saveSummaryPreview() {
+        guard let summaryPreview else { return }
+        do {
+            let destination = try PathResolver.uniqueDownloadDestination(suggestedName: summaryPreview.suggestedFilename)
+            try summaryPreview.summary.write(to: destination, atomically: true, encoding: .utf8)
+            NSWorkspace.shared.activateFileViewerSelecting([destination])
+            statusCenter.setActionStatus("已下載：\(destination.lastPathComponent)", tone: .success)
+        } catch {
+            statusCenter.setActionStatus("下載摘要失敗: \(error.localizedDescription)", tone: .error)
+        }
+    }
+
     func selectProofreadingMode(_ mode: ProofreadingMode) {
         guard mode != proofreadingMode else { return }
         proofreadingMode = mode
@@ -505,6 +603,29 @@ final class NativeAppModel: ObservableObject {
         } else {
             statusCenter.setActionStatus("已啟用 \(mode.displayName)", tone: .success)
         }
+    }
+
+    private func presentSummaryPreview(for item: QueueItemModel, summary: String) {
+        let displayTitle = item.result?.aiSuggestedTitle ?? item.filename
+        let safeStem = summaryFilenameStem(for: displayTitle)
+        withAnimation(.easeInOut(duration: 0.22)) {
+            summaryPreview = AISummaryPreviewModel(
+                fileId: item.fileId,
+                title: displayTitle,
+                summary: summary,
+                suggestedFilename: "\(safeStem)-摘要.txt"
+            )
+        }
+    }
+
+    private func summaryFilenameStem(for raw: String) -> String {
+        let invalid = CharacterSet(charactersIn: "\\/:*?\"<>|")
+        let cleaned = raw
+            .components(separatedBy: invalid)
+            .joined(separator: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "AI 摘要" : String(cleaned.prefix(40))
     }
 
     func goToNextOnboardingStep() {
@@ -818,18 +939,39 @@ final class NativeAppModel: ObservableObject {
             applySnapshot(snapshot)
         case .queuePaused(let message):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.clearTranscriptionStream()
             statusCenter.clearProofreadingStream()
+            statusCenter.clearActivityFeedback()
             statusCenter.setActionStatus(message, tone: .neutral)
         case .queueResumed(let message):
             statusCenter.setActionStatus(message, tone: .success)
         case .taskStarted(_, let filename):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.beginTranscriptionStream(initialStatus: "")
             statusCenter.clearProofreadingStream()
+            statusCenter.clearActivityFeedback()
             statusCenter.setActionStatus("開始轉譯 \(filename)", tone: .neutral)
-        case .taskProgress(_, let message, _):
+        case .taskProgress(let fileId, let message, _):
             statusCenter.setActionStatus(message, tone: .neutral)
-            if message.contains("AI 校稿") {
+            let itemPhase = queueItems.first(where: { $0.fileId == fileId })?.phase
+            if itemPhase == .proofreading || message.contains("AI 校稿") {
                 statusCenter.updateProofreadingLiveStatus(message)
+            } else if itemPhase == .transcribing {
+                statusCenter.clearActivityFeedback()
+            } else if itemPhase == .enhancing {
+                statusCenter.showActivityFeedback(ActivityFeedbackState(
+                    kind: .enhancing,
+                    title: "正在處理人聲增強",
+                    detail: "",
+                    progress: nil
+                ))
+            } else if itemPhase == .diarizing {
+                statusCenter.showActivityFeedback(ActivityFeedbackState(
+                    kind: .diarizing,
+                    title: "正在辨識不同說話者",
+                    detail: "",
+                    progress: nil
+                ))
             }
         case .taskLog(_, let message):
             statusCenter.appendDiagnosticLog(message)
@@ -838,25 +980,53 @@ final class NativeAppModel: ObservableObject {
             if itemPhase == .proofreading {
                 statusCenter.appendProofreadingStreamLine(text)
             } else {
-                statusCenter.addFloatingText(text)
+                statusCenter.appendTranscriptionStreamLine(text)
             }
         case .taskCompleted(_, let filename, _):
             statusCenter.stopFloatingTranscript(clearVisible: true)
-            statusCenter.finishProofreadingStream(finalMessage: "AI 校稿完成")
+            statusCenter.clearTranscriptionStream()
+            statusCenter.clearProofreadingStream()
+            statusCenter.clearActivityFeedback()
             statusCenter.setActionStatus("\(filename) 已完成", tone: .success)
         case .taskFailed(_, let message):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.clearTranscriptionStream()
             statusCenter.clearProofreadingStream()
+            statusCenter.clearActivityFeedback()
             statusCenter.setActionStatus(message, tone: .error)
         case .taskStopped(_, let message):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.clearTranscriptionStream()
             statusCenter.clearProofreadingStream()
+            statusCenter.clearActivityFeedback()
             statusCenter.setActionStatus(message, tone: .neutral)
         case .taskPhaseChanged(let fileId, let phase, let activePhases):
             if let idx = queueItems.firstIndex(where: { $0.fileId == fileId }) {
                 if phase == .proofreading {
                     statusCenter.stopFloatingTranscript(clearVisible: true)
+                    statusCenter.clearTranscriptionStream()
                     statusCenter.beginProofreadingStream()
+                    statusCenter.clearActivityFeedback()
+                } else if phase == .transcribing {
+                    statusCenter.beginTranscriptionStream(initialStatus: "")
+                } else if phase == .enhancing {
+                    statusCenter.clearTranscriptionStream()
+                    statusCenter.clearProofreadingStream()
+                    statusCenter.showActivityFeedback(ActivityFeedbackState(
+                        kind: .enhancing,
+                        title: "正在處理人聲增強",
+                        detail: "",
+                        progress: nil
+                    ))
+                } else if phase == .diarizing {
+                    statusCenter.clearTranscriptionStream()
+                    statusCenter.clearProofreadingStream()
+                    statusCenter.showActivityFeedback(ActivityFeedbackState(
+                        kind: .diarizing,
+                        title: "正在辨識不同說話者",
+                        detail: "",
+                        progress: nil
+                    ))
                 }
                 queueItems[idx].phase = phase
                 queueItems[idx].activePhases = activePhases
@@ -866,9 +1036,20 @@ final class NativeAppModel: ObservableObject {
             if let idx = queueItems.firstIndex(where: { $0.fileId == fileId }) {
                 queueItems[idx].downloadProgress = info
             }
+            let title = downloadFeedbackTitle(for: fileId)
+            statusCenter.clearTranscriptionStream()
+            statusCenter.clearProofreadingStream()
+            statusCenter.showActivityFeedback(ActivityFeedbackState(
+                kind: .downloading,
+                title: title,
+                detail: info.filename,
+                progress: info.fractionCompleted
+            ))
         case .backendError(let message):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.clearTranscriptionStream()
             statusCenter.clearProofreadingStream()
+            statusCenter.clearActivityFeedback()
             statusCenter.setActionStatus(message, tone: .error)
         }
     }
@@ -903,7 +1084,25 @@ final class NativeAppModel: ObservableObject {
 
         if !snapshot.isProcessing {
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.clearTranscriptionStream()
+            statusCenter.clearActivityFeedback()
         }
+    }
+
+    private func downloadFeedbackTitle(for fileId: String) -> String {
+        guard let item = queueItems.first(where: { $0.fileId == fileId }) else {
+            return "正在下載所需資料"
+        }
+        if item.activePhases.contains(.proofreading) {
+            return "正在準備 AI 校稿"
+        }
+        if item.activePhases.contains(.diarizing) {
+            return "正在準備語者辨識"
+        }
+        if item.activePhases.contains(.enhancing) {
+            return "正在準備人聲增強"
+        }
+        return "正在準備轉譯模型"
     }
 
     private func handleSystemWillSleep() {

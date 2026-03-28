@@ -1,32 +1,66 @@
-# Scribby v0.7.0-beta
+# Scribby v0.8.0-beta
 
-macOS 原生語音轉文字工具，支援多語者辨識、人聲加強與 AI 校稿。
+Scribby 是一個以 macOS 為主的本地語音轉寫工具，支援人聲增強、語者辨識、AI 校稿，以及 `readable` 模式下的 AI 主旨改名與摘要。
 
-## 功能
+## 目前能力
 
-- **SwiftWhisper + Core ML** 轉寫，支援 Apple Neural Engine 加速，99+ 語言自動偵測
-- **AI 校稿**（本地 LLM，Gemma 3 Text 4B，三種模式）：保守校正、一般校正、可讀版整理
-  - 模型本地推理，不需網路（首次下載後離線可用）
-- **pyannote 多語者辨識**（需 HuggingFace token）
-- **MossFormer2 人聲加強**（MLX 加速）
-- 分段彩色進度條，即時顯示各處理階段
-- 下載資訊卡片，顯示模型下載進度與速度
-- 首次使用自動安裝 Python 環境與依賴套件
-- `large-v3-turbo` 與 `large-v3` 都採 `mlpackage-first`
-- Core ML encoder 會從 HuggingFace 下載 `mlpackage.zip`，並在本機編譯成 `.mlmodelc`
-- 若本機編譯或載入失敗，會自動退回 CPU-only，不會卡死
+- 本地轉譯：`SwiftWhisper + whisper.cpp + Core ML`
+- 模型選擇：`tiny`、`large-v3-turbo`、`large-v3`
+- 人聲增強：`mlx-audio`
+- 語者辨識：`pyannote.audio`
+- AI 校稿：`Gemma 3 Text 4B`
+- `readable` 模式額外提供：
+  - AI 主旨檔名
+  - AI 摘要預覽與下載
+
+## 產品特性
+
+- 音訊在本地處理，不會離開電腦
+- 首次啟動會透過 wizard 準備所選功能
+- Whisper 模型與 Core ML encoder 採 `mlpackage-first`
+- `large-v3-turbo` / `large-v3` 會優先嘗試 `CPU_AND_NE`，失敗後再退到 `CPU_AND_GPU`，最後才是 CPU-only
+- UI 不直接顯示底層 log；等待中的狀態用卡片、進度條與動畫表達
+
+## 系統需求
+
+- macOS 13 以上
+- Apple Silicon
+- 首次使用需網路連線以下載模型與建立環境
 
 ## 安裝
 
-從 [Releases](https://github.com/minrui-z/Scribby/releases) 下載最新版本，解壓後拖入 Applications。
+從 [Releases](https://github.com/minrui-z/Scribby/releases) 下載最新版本，解壓後拖入 `Applications`。
 
-## Repo 結構
+目前為 beta，app 尚未完成 Apple 公證。首次開啟若被系統阻擋，可用以下任一方式：
 
-- `desktop-appkit/` — 原生 macOS app 主線
-- `desktop-appkit/Sources/` — App、Bridge、UI、Support
-- `desktop-appkit/swiftwhisper-core/` — headless SwiftWhisper 核心
-- `desktop-appkit/vendor/SwiftWhisper/` — 本地 fork 的 SwiftWhisper / whisper.cpp
-- `desktop-appkit/python/` — pyannote 語者辨識、speech enhancement、AI 校稿 helper
+1. Finder 對 app 按右鍵，選「打開」
+2. 或在終端機執行：
+
+```bash
+xattr -cr /path/to/逐字搞定\ Beta.app
+```
+
+## 首次啟動
+
+首次啟動會進入逐題 onboarding wizard，依序設定：
+
+1. 是否開啟人聲增強
+2. 使用哪個轉譯模型
+3. 是否開啟語者辨識
+4. 是否開啟 AI 校稿，以及校稿模式
+5. 安裝頁集中準備：
+   - 轉譯模型
+   - Core ML encoder
+   - enhancement / diarization / proofreading 環境
+   - AI 校稿模型
+
+## 本地資料
+
+模型、Python 環境、AI 校稿模型與 debug logs 會放在：
+
+- `~/Library/Application Support/com.minrui.scribby/`
+
+設定、首次精靈旗標與模型偏好則存在 `UserDefaults`。
 
 ## 開發
 
@@ -35,28 +69,15 @@ cd desktop-appkit
 ./build.sh
 ```
 
-編譯完成後 app 在 `desktop-appkit/build/逐字搞定 Beta.app`。
+產物位置：
 
-## 系統需求
+- `desktop-appkit/build/逐字搞定 Beta.app`
 
-- macOS 13 (Ventura) 以上
-- Apple Silicon（M1 以上）— Intel Mac 不支援
-- 首次使用需要網路連線（自動下載 Whisper 模型，約 1.5~2.9 GB；`large-v3-turbo` / `large-v3` 的 Core ML encoder package 也可能額外下載與本機編譯）
+## 文件
 
-## 首次開啟
-
-App 目前未經 Apple 公證，首次開啟時 macOS 會阻擋。請使用以下方式開啟：
-
-1. 在 Finder 中對 app 按右鍵（或 Control + 點擊）→ 選擇「打開」→ 再點「打開」
-2. 或在終端機執行：`xattr -cr /path/to/逐字搞定\ Beta.app`
-
-之後就可以正常雙擊開啟。
-
-## 注意事項
-
-- 語者辨識功能需要 [HuggingFace Token](https://huggingface.co/settings/tokens)，並在 pyannote 模型頁面完成授權
-- 人聲加強功能使用 MLX，僅支援 Apple Silicon
-- Python 環境會在首次使用語者辨識或人聲加強時自動建立（找不到系統 Python 時會自動下載獨立版本）
-- 部分少見音檔格式可能需要安裝 [ffmpeg](https://formulae.brew.sh/formula/ffmpeg)（`brew install ffmpeg`）
-- AI 校稿使用 `mlx-community/gemma-3-text-4b-it-4bit`（約 2.6 GB），第一次啟用時會先提示，再下載到 App Support
-- `large-v3-turbo` 與 `large-v3` 都不再依賴遠端預編譯 `.mlmodelc.zip`
+- [PROJECT_CONTEXT.md](./PROJECT_CONTEXT.md)
+  - 架構真相、資料流、模型策略、路徑與已知設計
+- [CLAUDE.md](./CLAUDE.md)
+  - 長期 invariant、發版規則、工作原則
+- [desktop-appkit/README.md](./desktop-appkit/README.md)
+  - 原生 workspace 的最短 build 入口

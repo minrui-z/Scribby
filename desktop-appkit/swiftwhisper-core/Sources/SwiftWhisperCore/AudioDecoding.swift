@@ -43,22 +43,19 @@ private struct ParsedWaveAudio {
 
 enum AudioDecoder {
     static func decodeAudio(from url: URL, diarize: Bool) throws -> DecodedAudio {
+        // Our app normalizes most transcription inputs into PCM WAV first.
+        // For those files, direct parsing is both simpler and more reliable
+        // than routing through AVFoundation and then falling back anyway.
+        if url.pathExtension.lowercased() == "wav" {
+            let decoded = try decodePCMWave(url, diarize: diarize)
+            Diagnostics.log("swiftwhisper: direct WAV parse succeeded")
+            return decoded
+        }
+
         do {
             return try decodeWithAVFoundation(from: url, diarize: diarize)
         } catch {
             Diagnostics.log("swiftwhisper: AVFoundation decode failed, fallback to direct WAV / ffmpeg: \(error.localizedDescription)")
-
-            // If the file is already a PCM WAV (e.g. pre-converted by the main app),
-            // parse it directly without AVFoundation or ffmpeg.
-            if url.pathExtension.lowercased() == "wav" {
-                do {
-                    let decoded = try decodePCMWave(url, diarize: diarize)
-                    Diagnostics.log("swiftwhisper: direct WAV parse succeeded")
-                    return decoded
-                } catch {
-                    Diagnostics.log("swiftwhisper: direct WAV parse failed: \(error.localizedDescription)")
-                }
-            }
 
             return try decodeWithFFmpeg(from: url, diarize: diarize)
         }
