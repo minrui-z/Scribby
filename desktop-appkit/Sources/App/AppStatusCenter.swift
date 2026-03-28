@@ -11,9 +11,14 @@ final class AppStatusCenter: ObservableObject {
     @Published private(set) var actionStatusTone: StatusTone = .neutral
     @Published private(set) var diagnosticLogLines: [String] = []
     @Published private(set) var floatingLines: [FloatingLineModel] = []
+    @Published private(set) var proofreadingStreamLines: [ProofreadingStreamLineModel] = []
+    @Published private(set) var proofreadingLiveStatus = ""
 
     private var pendingFloatingFragments: [String] = []
     private var floatingDrainTask: Task<Void, Never>?
+    private var lastFloatingMilestone = ""
+    private var lastFloatingMilestoneAt = Date.distantPast
+    private var proofreadingClearTask: Task<Void, Never>?
 
     var visibleActionStatus: String? {
         guard !actionStatus.isEmpty else { return nil }
@@ -40,6 +45,10 @@ final class AppStatusCenter: ObservableObject {
 
     var shouldShowDiagnostics: Bool {
         actionStatusTone == .error && !diagnosticLogLines.isEmpty
+    }
+
+    var isProofreadingStreaming: Bool {
+        !proofreadingLiveStatus.isEmpty || !proofreadingStreamLines.isEmpty
     }
 
     func markReady() {
@@ -78,6 +87,64 @@ final class AppStatusCenter: ObservableObject {
         if floatingDrainTask == nil {
             startFloatingDrainLoop()
         }
+    }
+
+    func addFloatingMilestone(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let now = Date()
+        if trimmed == lastFloatingMilestone, now.timeIntervalSince(lastFloatingMilestoneAt) < 0.8 {
+            return
+        }
+        lastFloatingMilestone = trimmed
+        lastFloatingMilestoneAt = now
+        pushFloatingFragment(trimmed)
+    }
+
+    func beginProofreadingStream(initialStatus: String = "正在 AI 校稿...") {
+        proofreadingClearTask?.cancel()
+        if proofreadingLiveStatus.isEmpty && proofreadingStreamLines.isEmpty {
+            proofreadingStreamLines = []
+        }
+        proofreadingLiveStatus = initialStatus
+    }
+
+    func updateProofreadingLiveStatus(_ text: String) {
+        proofreadingClearTask?.cancel()
+        proofreadingLiveStatus = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func appendProofreadingStreamLine(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        proofreadingClearTask?.cancel()
+        if proofreadingStreamLines.last?.text == trimmed { return }
+        proofreadingStreamLines.append(ProofreadingStreamLineModel(text: trimmed))
+        while proofreadingStreamLines.count > 4 {
+            proofreadingStreamLines.removeFirst()
+        }
+    }
+
+    func finishProofreadingStream(finalMessage: String? = nil) {
+        guard isProofreadingStreaming else { return }
+        proofreadingClearTask?.cancel()
+        if let finalMessage {
+            appendProofreadingStreamLine(finalMessage)
+        }
+        proofreadingLiveStatus = ""
+        proofreadingClearTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            guard let self else { return }
+            self.proofreadingStreamLines.removeAll()
+            self.proofreadingClearTask = nil
+        }
+    }
+
+    func clearProofreadingStream() {
+        proofreadingClearTask?.cancel()
+        proofreadingClearTask = nil
+        proofreadingLiveStatus = ""
+        proofreadingStreamLines.removeAll()
     }
 
     func stopFloatingTranscript(clearVisible: Bool) {

@@ -134,6 +134,12 @@ struct FloatingLineModel: Identifiable, Equatable {
     let delay: Double
 }
 
+struct ProofreadingStreamLineModel: Identifiable, Equatable {
+    let id = UUID()
+    let text: String
+    let createdAt = Date()
+}
+
 struct ProviderSnapshot: Equatable {
     var items: [QueueItemModel]
     var isProcessing: Bool

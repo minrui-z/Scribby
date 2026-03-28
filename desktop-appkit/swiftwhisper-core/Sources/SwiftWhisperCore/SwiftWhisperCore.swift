@@ -66,11 +66,18 @@ public struct SwiftWhisperRequest: Sendable, Codable {
     public var audioFileURL: URL
     public var languageCode: String
     public var diarize: Bool
+    public var disableCoreML: Bool
 
-    public init(audioFileURL: URL, languageCode: String = "auto", diarize: Bool = false) {
+    public init(
+        audioFileURL: URL,
+        languageCode: String = "auto",
+        diarize: Bool = false,
+        disableCoreML: Bool = false
+    ) {
         self.audioFileURL = audioFileURL
         self.languageCode = languageCode
         self.diarize = diarize
+        self.disableCoreML = disableCoreML
     }
 }
 
@@ -204,6 +211,16 @@ public actor SwiftWhisperCore {
         Diagnostics.log("swiftwhisper: ensuring model")
         let modelURL = try await ensureModel()
         Diagnostics.log("swiftwhisper: model ready at \(modelURL.path)")
+        let runtimeModel = try prepareRuntimeModel(from: modelURL, disableCoreML: request.disableCoreML)
+        let runtimeModelURL = runtimeModel.modelURL
+        defer {
+            if let cleanupDirectory = runtimeModel.cleanupDirectory {
+                try? FileManager.default.removeItem(at: cleanupDirectory)
+            }
+        }
+        if request.disableCoreML {
+            Diagnostics.log("swiftwhisper: disableCoreML enabled, using CPU-only model path \(runtimeModelURL.path)")
+        }
         let decodedAudio = try AudioDecoder.decodeAudio(from: request.audioFileURL, diarize: request.diarize)
         Diagnostics.log("swiftwhisper: decoded \(decodedAudio.monoFrames.count) PCM frames, language=\(code)")
 
@@ -218,7 +235,7 @@ public actor SwiftWhisperCore {
         params.single_segment = false
 
         Diagnostics.log("swiftwhisper: creating whisper context")
-        let whisper = Whisper(fromFileURL: modelURL, withParams: params)
+        let whisper = Whisper(fromFileURL: runtimeModelURL, withParams: params)
         let delegate = StreamingDelegate { event in
             onEvent(event)
         }
@@ -263,6 +280,35 @@ public actor SwiftWhisperCore {
         return finalResult
     }
 
+    private func prepareRuntimeModel(from modelURL: URL, disableCoreML: Bool) throws -> RuntimeModel {
+        guard disableCoreML else {
+            return RuntimeModel(modelURL: modelURL, cleanupDirectory: nil)
+        }
+
+        let fileManager = FileManager.default
+        let encoderName = modelURL.deletingPathExtension().lastPathComponent + "-encoder.mlmodelc"
+        let encoderURL = modelURL.deletingLastPathComponent().appendingPathComponent(encoderName, isDirectory: true)
+
+        // If there is no adjacent encoder asset, the original model URL is already CPU-only.
+        guard fileManager.fileExists(atPath: encoderURL.path) else {
+            return RuntimeModel(modelURL: modelURL, cleanupDirectory: nil)
+        }
+
+        let shadowDirectory = fileManager.temporaryDirectory
+            .appendingPathComponent("scribby-cpu-only-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: shadowDirectory, withIntermediateDirectories: true)
+
+        let shadowModelURL = shadowDirectory.appendingPathComponent(modelURL.lastPathComponent)
+        do {
+            try fileManager.createSymbolicLink(at: shadowModelURL, withDestinationURL: modelURL)
+        } catch {
+            // Symlink keeps this lightweight, but copy is a safe fallback.
+            try fileManager.copyItem(at: modelURL, to: shadowModelURL)
+        }
+
+        return RuntimeModel(modelURL: shadowModelURL, cleanupDirectory: shadowDirectory)
+    }
+
     private static func inferSpeakerLabels(
         for segments: [Segment],
         stereoChannels: [[Float]]?
@@ -301,6 +347,11 @@ public actor SwiftWhisperCore {
             return "說話者 ?"
         }
     }
+}
+
+private struct RuntimeModel {
+    let modelURL: URL
+    let cleanupDirectory: URL?
 }
 
 private final class StreamingDelegate: WhisperDelegate {

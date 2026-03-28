@@ -4,6 +4,33 @@ import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
 
+enum OnboardingWizardStep: Int, CaseIterable {
+    case enhancement
+    case model
+    case diarization
+    case proofreading
+    case install
+
+    var title: String {
+        switch self {
+        case .enhancement: return "人聲增強"
+        case .model: return "轉寫模型"
+        case .diarization: return "語者辨識"
+        case .proofreading: return "AI 校稿"
+        case .install: return "安裝與準備"
+        }
+    }
+}
+
+struct OnboardingSelection: Equatable {
+    var enableEnhancement: Bool?
+    var selectedModelPreset: WhisperModelPreset?
+    var enableDiarization: Bool?
+    var pendingDiarizationToken = ""
+    var enableProofreading: Bool?
+    var proofreadingMode: ProofreadingMode = .standard
+}
+
 @MainActor
 final class NativeAppModel: ObservableObject {
     @Published var queueItems: [QueueItemModel] = []
@@ -38,6 +65,18 @@ final class NativeAppModel: ObservableObject {
         didSet { UserDefaults.standard.set(selectedModelPreset.rawValue, forKey: "selectedModelPreset") }
     }
     @Published var showModelManager = false
+    @Published var showOnboardingWizard = false
+    @Published var onboardingStep: OnboardingWizardStep = .enhancement
+    @Published var onboardingSelection = OnboardingSelection()
+    @Published private(set) var isPreparingOnboardingChoices = false
+    @Published var onboardingPreparationStatus = ""
+    @Published var onboardingPreparationProgress = 0.0
+    @Published var onboardingPreparationNotes: [String] = []
+    @Published var onboardingTokenStatus = ""
+    @Published var onboardingTokenStatusTone: StatusTone = .neutral
+    @Published var isVerifyingOnboardingToken = false
+    @Published private(set) var onboardingActivePreparationGroup: String?
+    @Published private(set) var onboardingCompletedPreparationGroups: Set<String> = []
     @Published var proofreadingMode: ProofreadingMode = .off {
         didSet { UserDefaults.standard.set(proofreadingMode.rawValue, forKey: "proofreadingMode") }
     }
@@ -48,6 +87,11 @@ final class NativeAppModel: ObservableObject {
     private let statusCenter = AppStatusCenter()
     private let sleepWakeCoordinator = SleepWakeCoordinator()
     private var statusObservation: AnyCancellable?
+    private let firstRunWizardCompletedKey = "firstRunWizardCompleted"
+    private let firstTranscriptionWarmupNoticePrefix = "firstTranscriptionWarmupNoticeShown."
+    private var onboardingPreparationTotalSteps = 0
+    private var onboardingPreparationCompletedGroups = Set<String>()
+    private var onboardingRequiresEncoder = false
 
     var pickerStatus: String { statusCenter.pickerStatus }
     var pickerStatusTone: StatusTone { statusCenter.pickerStatusTone }
@@ -55,6 +99,9 @@ final class NativeAppModel: ObservableObject {
     var actionStatusTone: StatusTone { statusCenter.actionStatusTone }
     var diagnosticLogLines: [String] { statusCenter.diagnosticLogLines }
     var floatingLines: [FloatingLineModel] { statusCenter.floatingLines }
+    var proofreadingStreamLines: [ProofreadingStreamLineModel] { statusCenter.proofreadingStreamLines }
+    var proofreadingLiveStatus: String { statusCenter.proofreadingLiveStatus }
+    var isProofreadingStreaming: Bool { statusCenter.isProofreadingStreaming }
     var visiblePickerStatus: String? { statusCenter.visiblePickerStatus }
     var visibleActionStatus: String? { statusCenter.visibleActionStatus }
     var shouldShowDiagnostics: Bool { statusCenter.shouldShowDiagnostics }
@@ -110,6 +157,11 @@ final class NativeAppModel: ObservableObject {
         isPaused && queueItems.contains { $0.status == .pending }
     }
 
+    var shouldShowFirstTranscriptionWarmupNotice: Bool {
+        guard !isProcessing, canStart, selectedModelPreset.coreMLEncoderProvisioning != .none else { return false }
+        return !UserDefaults.standard.bool(forKey: firstTranscriptionWarmupNoticeKey(for: selectedModelPreset))
+    }
+
     var showCompactAddButton: Bool {
         isProcessing || isPaused
     }
@@ -143,6 +195,7 @@ final class NativeAppModel: ObservableObject {
                     supportsHardStop = info.supportsHardStop
                     statusCenter.markReady()
                     statusCenter.setActionStatus("SwiftWhisper 純 Swift 核心已就緒", tone: .success)
+                    presentOnboardingWizardIfNeeded()
                     sleepWakeCoordinator.start()
                 } catch {
                     statusCenter.setActionStatus("啟動 backend 失敗: \(error.localizedDescription)", tone: .error)
@@ -281,7 +334,51 @@ final class NativeAppModel: ObservableObject {
         }
     }
 
+    func verifyOnboardingToken() {
+        let normalized = onboardingSelection.pendingDiarizationToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            onboardingTokenStatus = "請先輸入 Hugging Face Token"
+            onboardingTokenStatusTone = .error
+            return
+        }
+
+        isVerifyingOnboardingToken = true
+        onboardingTokenStatus = "validating"
+        onboardingTokenStatusTone = .neutral
+
+        Task {
+            do {
+                let result = try await provider.verifyToken(normalized)
+                isVerifyingOnboardingToken = false
+                onboardingTokenStatus = result.ok ? "success" : "failure"
+                onboardingTokenStatusTone = result.ok ? .success : .error
+            } catch {
+                isVerifyingOnboardingToken = false
+                onboardingTokenStatus = "failure"
+                onboardingTokenStatusTone = .error
+            }
+        }
+    }
+
+    var canAdvanceCurrentOnboardingStep: Bool {
+        switch onboardingStep {
+        case .enhancement:
+            return onboardingSelection.enableEnhancement != nil
+        case .model:
+            return onboardingSelection.selectedModelPreset != nil
+        case .diarization:
+            return onboardingSelection.enableDiarization != nil
+        case .proofreading:
+            return onboardingSelection.enableProofreading != nil
+        case .install:
+            return !isPreparingOnboardingChoices && onboardingPreparationProgress >= 1.0
+        }
+    }
+
     func startTranscription() {
+        if shouldShowFirstTranscriptionWarmupNotice {
+            UserDefaults.standard.set(true, forKey: firstTranscriptionWarmupNoticeKey(for: selectedModelPreset))
+        }
         statusCenter.setActionStatus("正在啟動轉譯...", tone: .neutral)
         Task {
             do {
@@ -400,6 +497,147 @@ final class NativeAppModel: ObservableObject {
         statusCenter.setActionStatus("已複製逐字稿內容", tone: .success)
     }
 
+    func selectProofreadingMode(_ mode: ProofreadingMode) {
+        guard mode != proofreadingMode else { return }
+        proofreadingMode = mode
+        if mode == .off {
+            statusCenter.setActionStatus("已關閉 AI 校稿", tone: .neutral)
+        } else {
+            statusCenter.setActionStatus("已啟用 \(mode.displayName)", tone: .success)
+        }
+    }
+
+    func goToNextOnboardingStep() {
+        guard let next = OnboardingWizardStep(rawValue: onboardingStep.rawValue + 1),
+              onboardingStep != .install,
+              !isPreparingOnboardingChoices else { return }
+        withAnimation(.easeInOut(duration: 0.22)) {
+            onboardingStep = next
+        }
+    }
+
+    func goToPreviousOnboardingStep() {
+        guard let previous = OnboardingWizardStep(rawValue: onboardingStep.rawValue - 1),
+              onboardingStep != .install,
+              !isPreparingOnboardingChoices else { return }
+        withAnimation(.easeInOut(duration: 0.22)) {
+            onboardingStep = previous
+        }
+    }
+
+    func beginOnboardingPreparation() {
+        UserDefaults.standard.set(true, forKey: firstRunWizardCompletedKey)
+
+        let selection = onboardingSelection
+        let normalizedToken = selection.pendingDiarizationToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedEnhancement = selection.enableEnhancement ?? false
+        let resolvedModel = selection.selectedModelPreset ?? .default
+        let resolvedDiarization = selection.enableDiarization ?? false
+        let resolvedProofreading = selection.enableProofreading ?? false
+
+        enhancementEnabled = resolvedEnhancement
+        diarizeEnabled = resolvedDiarization
+        proofreadingMode = resolvedProofreading ? selection.proofreadingMode : .off
+        if !normalizedToken.isEmpty {
+            token = normalizedToken
+        }
+
+        if resolvedModel != selectedModelPreset {
+            switchModel(to: resolvedModel)
+        }
+
+        let shouldPrepareModel = true
+        let shouldPrepareEncoder = resolvedModel.coreMLEncoderProvisioning != .none
+        let shouldPrepareEnhancement = resolvedEnhancement
+        let shouldPrepareDiarization = resolvedDiarization && !normalizedToken.isEmpty
+        let shouldPrepareProofreading = resolvedProofreading
+
+        onboardingPreparationNotes = []
+        if resolvedDiarization && normalizedToken.isEmpty {
+            onboardingPreparationNotes.append("語者辨識已保留為稍後設定；補上 Hugging Face Token 後即可完成授權。")
+        }
+        onboardingPreparationNotes.append("高效能模型首次 Neural Engine 準備可能需要 2-3 分鐘。")
+        onboardingRequiresEncoder = shouldPrepareEncoder
+        onboardingPreparationTotalSteps = [
+            shouldPrepareModel,
+            shouldPrepareEnhancement,
+            shouldPrepareDiarization,
+            shouldPrepareProofreading,
+        ].filter { $0 }.count
+        onboardingPreparationCompletedGroups = []
+        onboardingCompletedPreparationGroups = []
+        onboardingActivePreparationGroup = nil
+        onboardingPreparationProgress = onboardingPreparationTotalSteps == 0 ? 1.0 : 0.0
+        onboardingPreparationStatus = "正在整理首次設定..."
+
+        withAnimation(.easeInOut(duration: 0.22)) {
+            onboardingStep = .install
+        }
+
+        guard shouldPrepareModel || shouldPrepareEnhancement || shouldPrepareDiarization || shouldPrepareProofreading else {
+            isPreparingOnboardingChoices = false
+            onboardingPreparationStatus = "首次設定已完成。之後可直接開始使用，也可在設定調整進階功能。"
+            statusCenter.setActionStatus("首次設定已完成", tone: .success)
+            return
+        }
+
+        isPreparingOnboardingChoices = true
+        statusCenter.setActionStatus("正在準備首次設定...", tone: .neutral)
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await provider.prepareAdvancedFeatures(
+                    modelPreset: resolvedModel,
+                    enhancement: shouldPrepareEnhancement,
+                    diarization: shouldPrepareDiarization,
+                    proofreading: shouldPrepareProofreading,
+                    log: { [weak self] message in
+                        Task { @MainActor in
+                            guard let self else { return }
+                            self.onboardingPreparationStatus = message
+                            self.updateOnboardingPreparationProgress(with: message)
+                            self.statusCenter.setActionStatus(message, tone: .neutral)
+                        }
+                    }
+                )
+
+                await MainActor.run {
+                    self.isPreparingOnboardingChoices = false
+                    self.onboardingPreparationProgress = 1.0
+                    self.onboardingActivePreparationGroup = nil
+                    self.onboardingPreparationStatus = "首次設定已完成。之後可直接開始使用，功能也可在設定調整。"
+                    self.statusCenter.setActionStatus("首次設定已完成", tone: .success)
+                }
+            } catch {
+                await MainActor.run {
+                    self.isPreparingOnboardingChoices = false
+                    self.onboardingActivePreparationGroup = nil
+                    self.onboardingPreparationStatus = "準備失敗：\(error.localizedDescription)"
+                    if self.onboardingPreparationNotes.last != self.onboardingPreparationStatus {
+                        self.onboardingPreparationNotes.append(self.onboardingPreparationStatus)
+                    }
+                    self.statusCenter.setActionStatus("準備首次設定失敗: \(error.localizedDescription)", tone: .error)
+                }
+            }
+        }
+    }
+
+    func completeOnboardingWizard() {
+        UserDefaults.standard.set(true, forKey: firstRunWizardCompletedKey)
+        withAnimation(.easeInOut(duration: 0.22)) {
+            showOnboardingWizard = false
+        }
+    }
+
+    func skipOnboardingWizard() {
+        UserDefaults.standard.set(true, forKey: firstRunWizardCompletedKey)
+        withAnimation(.easeInOut(duration: 0.22)) {
+            showOnboardingWizard = false
+        }
+        statusCenter.setActionStatus("已略過首次設定，之後都可在設定調整。", tone: .neutral)
+    }
+
     private func loadPersistedSettings() {
         let defaults = UserDefaults.standard
         if let lang = defaults.string(forKey: "selectedLanguage") {
@@ -420,6 +658,134 @@ final class NativeAppModel: ObservableObject {
            let mode = ProofreadingMode(rawValue: modeRaw) {
             proofreadingMode = mode
         }
+    }
+
+    private func presentOnboardingWizardIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: firstRunWizardCompletedKey) else { return }
+
+        onboardingSelection = OnboardingSelection(
+            enableEnhancement: nil,
+            selectedModelPreset: nil,
+            enableDiarization: nil,
+            pendingDiarizationToken: "",
+            enableProofreading: nil,
+            proofreadingMode: .standard
+        )
+        onboardingStep = .enhancement
+        onboardingPreparationStatus = ""
+        onboardingPreparationProgress = 0.0
+        onboardingPreparationNotes = []
+        onboardingTokenStatus = ""
+        onboardingTokenStatusTone = .neutral
+        isVerifyingOnboardingToken = false
+        onboardingActivePreparationGroup = nil
+        onboardingCompletedPreparationGroups = []
+
+        withAnimation(.easeInOut(duration: 0.24)) {
+            showOnboardingWizard = true
+        }
+    }
+
+    private func updateOnboardingPreparationProgress(with message: String) {
+        onboardingPreparationStatus = condensedOnboardingPreparationStatus(from: message)
+
+        let modelStarts = ["正在下載 Whisper 模型", "正在準備 Core ML encoder"]
+        let modelDone = ["Whisper 模型已就緒", "Core ML encoder 已就緒"]
+        let proofreadingStarts = ["正在建立AI 校稿環境", "正在準備 AI 校稿模型", "正在載入 AI 校稿模型", "正在下載 AI 校稿模型"]
+        let proofreadingDone = ["AI 校稿模型已就緒", "AI 校稿已就緒"]
+
+        if modelStarts.contains(where: { message.contains($0) }) {
+            onboardingActivePreparationGroup = "whisper"
+        }
+        if message.contains("正在建立人聲加強環境") {
+            onboardingActivePreparationGroup = "enhancement"
+        }
+        if message.contains("正在建立語者辨識環境") {
+            onboardingActivePreparationGroup = "diarization"
+        }
+        if proofreadingStarts.contains(where: { message.contains($0) }) {
+            onboardingActivePreparationGroup = "proofreading"
+        }
+
+        if modelDone.contains(where: { message.contains($0) }) {
+            if message.contains("Whisper 模型已就緒") {
+                onboardingPreparationCompletedGroups.insert("model")
+            }
+            if message.contains("Core ML encoder 已就緒") {
+                onboardingPreparationCompletedGroups.insert("encoder")
+            }
+            let whisperReady = onboardingPreparationCompletedGroups.contains("model")
+                && (!onboardingRequiresEncoder || onboardingPreparationCompletedGroups.contains("encoder"))
+            if whisperReady {
+                onboardingCompletedPreparationGroups.insert("whisper")
+                if onboardingActivePreparationGroup == "whisper" {
+                    onboardingActivePreparationGroup = nil
+                }
+            }
+        }
+
+        if message.contains("人聲加強已就緒") {
+            onboardingCompletedPreparationGroups.insert("enhancement")
+            if onboardingActivePreparationGroup == "enhancement" {
+                onboardingActivePreparationGroup = nil
+            }
+        }
+
+        if message.contains("語者辨識已就緒") {
+            onboardingCompletedPreparationGroups.insert("diarization")
+            if onboardingActivePreparationGroup == "diarization" {
+                onboardingActivePreparationGroup = nil
+            }
+        }
+
+        if proofreadingDone.contains(where: { message.contains($0) }) {
+            onboardingCompletedPreparationGroups.insert("proofreading")
+            if onboardingActivePreparationGroup == "proofreading" {
+                onboardingActivePreparationGroup = nil
+            }
+        }
+
+        guard onboardingPreparationTotalSteps > 0 else {
+            onboardingPreparationProgress = 1.0
+            return
+        }
+
+        onboardingPreparationProgress = Double(onboardingPreparationCompletedGroups.count) / Double(onboardingPreparationTotalSteps)
+    }
+
+    private func firstTranscriptionWarmupNoticeKey(for preset: WhisperModelPreset) -> String {
+        firstTranscriptionWarmupNoticePrefix + preset.rawValue
+    }
+
+    private func condensedOnboardingPreparationStatus(from message: String) -> String {
+        if message.contains("正在下載 Whisper 模型") || message.contains("正在準備 Core ML encoder") {
+            return "正在準備轉譯模型..."
+        }
+        if message.contains("Whisper 模型已就緒") || message.contains("Core ML encoder 已就緒") {
+            return "轉譯模型已就緒"
+        }
+        if message.contains("正在建立人聲加強環境") {
+            return "正在準備人聲增強..."
+        }
+        if message.contains("人聲加強已就緒") {
+            return "人聲增強已就緒"
+        }
+        if message.contains("正在建立語者辨識環境") {
+            return "正在準備語者辨識..."
+        }
+        if message.contains("語者辨識已就緒") {
+            return "語者辨識已就緒"
+        }
+        if message.contains("正在建立AI 校稿環境")
+            || message.contains("正在準備 AI 校稿模型")
+            || message.contains("正在載入 AI 校稿模型")
+            || message.contains("正在下載 AI 校稿模型") {
+            return "正在準備 AI 校稿..."
+        }
+        if message.contains("AI 校稿模型已就緒") || message.contains("AI 校稿已就緒") {
+            return "AI 校稿已就緒"
+        }
+        return "正在準備環境..."
     }
 
     private func enqueue(paths: [String], sourceLabel: String) async {
@@ -452,29 +818,46 @@ final class NativeAppModel: ObservableObject {
             applySnapshot(snapshot)
         case .queuePaused(let message):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.clearProofreadingStream()
             statusCenter.setActionStatus(message, tone: .neutral)
         case .queueResumed(let message):
             statusCenter.setActionStatus(message, tone: .success)
         case .taskStarted(_, let filename):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.clearProofreadingStream()
             statusCenter.setActionStatus("開始轉譯 \(filename)", tone: .neutral)
         case .taskProgress(_, let message, _):
             statusCenter.setActionStatus(message, tone: .neutral)
+            if message.contains("AI 校稿") {
+                statusCenter.updateProofreadingLiveStatus(message)
+            }
         case .taskLog(_, let message):
             statusCenter.appendDiagnosticLog(message)
-        case .taskPartialText(_, let text):
-            statusCenter.addFloatingText(text)
+        case .taskPartialText(let fileId, let text):
+            let itemPhase = queueItems.first(where: { $0.fileId == fileId })?.phase
+            if itemPhase == .proofreading {
+                statusCenter.appendProofreadingStreamLine(text)
+            } else {
+                statusCenter.addFloatingText(text)
+            }
         case .taskCompleted(_, let filename, _):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.finishProofreadingStream(finalMessage: "AI 校稿完成")
             statusCenter.setActionStatus("\(filename) 已完成", tone: .success)
         case .taskFailed(_, let message):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.clearProofreadingStream()
             statusCenter.setActionStatus(message, tone: .error)
         case .taskStopped(_, let message):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.clearProofreadingStream()
             statusCenter.setActionStatus(message, tone: .neutral)
         case .taskPhaseChanged(let fileId, let phase, let activePhases):
             if let idx = queueItems.firstIndex(where: { $0.fileId == fileId }) {
+                if phase == .proofreading {
+                    statusCenter.stopFloatingTranscript(clearVisible: true)
+                    statusCenter.beginProofreadingStream()
+                }
                 queueItems[idx].phase = phase
                 queueItems[idx].activePhases = activePhases
                 queueItems[idx].downloadProgress = nil
@@ -482,13 +865,10 @@ final class NativeAppModel: ObservableObject {
         case .taskDownloadProgress(let fileId, let info):
             if let idx = queueItems.firstIndex(where: { $0.fileId == fileId }) {
                 queueItems[idx].downloadProgress = info
-                if !queueItems[idx].activePhases.contains(.downloading) {
-                    queueItems[idx].activePhases.insert(.downloading, at: 0)
-                }
-                queueItems[idx].phase = .downloading
             }
         case .backendError(let message):
             statusCenter.stopFloatingTranscript(clearVisible: true)
+            statusCenter.clearProofreadingStream()
             statusCenter.setActionStatus(message, tone: .error)
         }
     }

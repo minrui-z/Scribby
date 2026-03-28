@@ -46,6 +46,49 @@ static void whisper_backend_load_all_once() {
     });
 }
 
+static void whisper_debug_dump_encoder_if_requested(const ggml_tensor * tensor) {
+    const char * raw_path = getenv("SCRIBBY_DUMP_ENCODER_PATH");
+    if (raw_path == nullptr || tensor == nullptr || tensor->data == nullptr) {
+        return;
+    }
+
+    std::string output_path(raw_path);
+    std::ifstream existing(output_path, std::ios::binary);
+    if (existing.good()) {
+        return;
+    }
+
+    const size_t element_count = ggml_nelements(tensor);
+    const size_t byte_count = element_count * sizeof(float);
+
+    std::ofstream out(output_path, std::ios::binary);
+    if (!out.is_open()) {
+        fprintf(stderr, "%s: failed to open encoder dump path: %s\n", __func__, output_path.c_str());
+        return;
+    }
+
+    out.write(reinterpret_cast<const char *>(tensor->data), (std::streamsize) byte_count);
+    out.close();
+
+    std::ofstream meta(output_path + ".meta.txt", std::ios::trunc);
+    if (meta.is_open()) {
+        meta << "type=" << ggml_type_name(tensor->type) << "\n";
+        meta << "ne0=" << tensor->ne[0] << "\n";
+        meta << "ne1=" << tensor->ne[1] << "\n";
+        meta << "ne2=" << tensor->ne[2] << "\n";
+        meta << "ne3=" << tensor->ne[3] << "\n";
+        meta << "nb0=" << tensor->nb[0] << "\n";
+        meta << "nb1=" << tensor->nb[1] << "\n";
+        meta << "nb2=" << tensor->nb[2] << "\n";
+        meta << "nb3=" << tensor->nb[3] << "\n";
+        meta << "elements=" << element_count << "\n";
+        meta << "bytes=" << byte_count << "\n";
+        meta.close();
+    }
+
+    fprintf(stderr, "%s: dumped encoder tensor to '%s'\n", __func__, output_path.c_str());
+}
+
 #if defined(WHISPER_BIG_ENDIAN)
 template<typename T>
 static T byteswap(T value) {
@@ -2440,6 +2483,8 @@ static bool whisper_encode_internal(
             return false;
         }
     }
+
+    whisper_debug_dump_encoder_if_requested(wstate.embd_enc);
 
     // cross
     {

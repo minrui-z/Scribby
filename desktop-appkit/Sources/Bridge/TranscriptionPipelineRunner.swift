@@ -1,7 +1,154 @@
 import AVFoundation
 import Foundation
 
+private enum CoreMLExecutionMode: String, Equatable {
+    case disabled
+    case cpuAndGpu = "cpu_and_gpu"
+    case cpuAndNe = "cpu_and_ne"
+
+    var usesCoreML: Bool {
+        self != .disabled
+    }
+
+    var environmentValue: String? {
+        switch self {
+        case .disabled:
+            return nil
+        case .cpuAndGpu:
+            return "cpu_and_gpu"
+        case .cpuAndNe:
+            return "cpu_and_ne"
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .disabled:
+            return "CPU-only"
+        case .cpuAndGpu:
+            return "CPU_AND_GPU"
+        case .cpuAndNe:
+            return "CPU_AND_NE"
+        }
+    }
+
+    var loadTimeout: TimeInterval {
+        switch self {
+        case .disabled:
+            return 0
+        case .cpuAndGpu:
+            return 20
+        case .cpuAndNe:
+            return 240
+        }
+    }
+}
+
 enum TranscriptionPipelineRunner {
+    private static let coreMLStallErrorCode = 70_001
+
+    static func prepareWhisperAssets(
+        modelPreset: WhisperModelPreset,
+        log: @escaping @Sendable (String) -> Void = { _ in },
+        downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void = { _, _, _ in }
+    ) async throws {
+        let fileManager = FileManager.default
+        let modelDir = try PathResolver.swiftWhisperModelDirectory()
+        let modelURL = modelDir.appendingPathComponent(modelPreset.filename, isDirectory: false)
+
+        if fileManager.fileExists(atPath: modelURL.path) {
+            log("Whisper 模型已就緒")
+        } else {
+            log("正在下載 Whisper 模型...")
+            let tempModel = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            defer { try? fileManager.removeItem(at: tempModel) }
+
+            try await downloadFile(
+                from: URL(string: modelPreset.remoteURL)!,
+                to: tempModel,
+                progressHandler: { downloaded, total in
+                    downloadProgress(modelPreset.filename, downloaded, total)
+                }
+            )
+
+            guard let attributes = try? fileManager.attributesOfItem(atPath: tempModel.path),
+                  let size = attributes[.size] as? Int64,
+                  size >= 1_000_000 else {
+                throw NSError(
+                    domain: "SwiftWhisperProvider",
+                    code: 73_201,
+                    userInfo: [NSLocalizedDescriptionKey: "Whisper 模型下載後檔案大小異常"]
+                )
+            }
+
+            try? fileManager.removeItem(at: modelURL)
+            try fileManager.moveItem(at: tempModel, to: modelURL)
+            log("Whisper 模型已就緒")
+        }
+
+        guard modelPreset.coreMLEncoderProvisioning != .none else { return }
+
+        log("正在準備 Core ML encoder...")
+        _ = try await prepareCoreMLAssetsIfAvailable(
+            for: modelPreset,
+            into: modelDir,
+            preferredMode: preferredCoreMLExecutionMode(for: modelPreset),
+            log: log,
+            downloadProgress: downloadProgress
+        )
+        log("Core ML encoder 已就緒")
+    }
+
+    static func prepareProofreadingAssets(
+        log: @escaping @Sendable (String) -> Void = { _ in }
+    ) async throws {
+        let python = try PathResolver.pythonExecutable()
+        let helper = try PathResolver.proofreadingHelperScript()
+        let cacheDir = try await ModelCatalog.shared.llmModelCacheDirectory()
+
+        let process = Process()
+        process.executableURL = python
+        process.arguments = [helper.path, "--warmup"]
+
+        var env = try PathResolver.backendEnvironment()
+        env["SCRIBBY_MLX_MODEL_CACHE"] = cacheDir.path
+        process.environment = env
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        let collectedStderr = StderrCollector()
+        let stderrHandle = stderr.fileHandleForReading
+        stderrHandle.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let text = String(decoding: data, as: UTF8.self)
+            collectedStderr.append(text)
+            for line in text.split(whereSeparator: \.isNewline) {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                log(trimmed)
+            }
+        }
+
+        try process.run()
+        process.waitUntilExit()
+        stderrHandle.readabilityHandler = nil
+
+        guard process.terminationStatus == 0 else {
+            let errText = collectedStderr.tail(maxLines: 20)
+            throw NSError(
+                domain: "SwiftWhisperProvider",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: errText.isEmpty
+                    ? "AI 校稿模型準備失敗（exit \(process.terminationStatus)）"
+                    : errText]
+            )
+        }
+    }
+
     static func runChunkedHeadless(
         filePath: String,
         language: String,
@@ -75,21 +222,131 @@ enum TranscriptionPipelineRunner {
         downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void = { _, _, _ in }
     ) async throws -> HeadlessResult {
         let modelDir = try PathResolver.swiftWhisperModelDirectory()
-        try await syncCoreMLAssetsIfAvailable(for: modelPreset, into: modelDir, downloadProgress: downloadProgress)
+        let supportsCoreML = modelPreset.coreMLRuntimeEnabled && modelPreset.coreMLEncoderProvisioning != .none
+        let sessionRegistry = CoreMLEncoderSessionRegistry.shared
+        let coreMLDisabledForSession = sessionRegistry.isDisabled(modelPreset)
+        let coreMLMode: CoreMLExecutionMode
 
+        if supportsCoreML && !sessionRegistry.isDisabled(modelPreset) {
+            let preferredMode = preferredCoreMLExecutionMode(for: modelPreset)
+            let requestedMode: CoreMLExecutionMode
+            if preferredMode == .cpuAndNe && sessionRegistry.isNeDisabled(modelPreset) {
+                requestedMode = .cpuAndGpu
+            } else {
+                requestedMode = preferredMode
+            }
+
+            let preparedMode = try await prepareCoreMLAssetsIfAvailable(
+                for: modelPreset,
+                into: modelDir,
+                preferredMode: requestedMode,
+                log: log,
+                downloadProgress: downloadProgress
+            )
+            if requestedMode == .cpuAndNe && preparedMode == .cpuAndGpu {
+                sessionRegistry.disableNe(modelPreset)
+            }
+            coreMLMode = preparedMode
+        } else if supportsCoreML && coreMLDisabledForSession {
+            log("已停用 \(modelPreset.rawValue) Core ML encoder，改走 CPU-only fallback")
+            try purgeCoreMLAssets(for: modelPreset, into: modelDir, log: log)
+            coreMLMode = .disabled
+        } else {
+            if modelPreset.coreMLEncoderProvisioning != .none && !modelPreset.coreMLRuntimeEnabled {
+                log("已暫時停用 \(modelPreset.rawValue) Core ML runtime：目前 encoder 資產會導致轉寫內容異常，改走 CPU-only")
+            }
+            coreMLMode = .disabled
+        }
+
+        do {
+            return try await runHeadlessProcess(
+                filePath: filePath,
+                language: language,
+                diarize: diarize,
+                modelPreset: modelPreset,
+                modelDir: modelDir,
+                processSupervisor: processSupervisor,
+                event: event,
+                log: log,
+                downloadProgress: downloadProgress,
+                coreMLMode: coreMLMode
+            )
+        } catch let error as NSError
+        where error.domain == "SwiftWhisperProvider"
+            && error.code == coreMLStallErrorCode
+            && coreMLMode.usesCoreML {
+            if coreMLMode == .cpuAndNe {
+                log("偵測到 \(modelPreset.rawValue) 的 CPU_AND_NE Core ML 載入逾時，改走 CPU_AND_GPU fallback")
+                sessionRegistry.disableNe(modelPreset)
+                return try await runHeadlessProcess(
+                    filePath: filePath,
+                    language: language,
+                    diarize: diarize,
+                    modelPreset: modelPreset,
+                    modelDir: modelDir,
+                    processSupervisor: processSupervisor,
+                    event: event,
+                    log: log,
+                    downloadProgress: downloadProgress,
+                    coreMLMode: .cpuAndGpu
+                )
+            }
+
+            log("偵測到 \(modelPreset.rawValue) 的 CPU_AND_GPU Core ML 載入逾時，清除 encoder 快取並改走 CPU-only fallback")
+            sessionRegistry.disable(modelPreset)
+            try purgeCoreMLAssets(for: modelPreset, into: modelDir, log: log)
+            return try await runHeadlessProcess(
+                filePath: filePath,
+                language: language,
+                diarize: diarize,
+                modelPreset: modelPreset,
+                modelDir: modelDir,
+                processSupervisor: processSupervisor,
+                event: event,
+                log: log,
+                downloadProgress: downloadProgress,
+                coreMLMode: .disabled
+            )
+        }
+    }
+
+    private static func runHeadlessProcess(
+        filePath: String,
+        language: String,
+        diarize: Bool,
+        modelPreset: WhisperModelPreset,
+        modelDir: URL,
+        processSupervisor: ProcessSupervisor,
+        event: @escaping @Sendable (HeadlessStreamEvent) -> Void,
+        log: @escaping @Sendable (String) -> Void = { _ in },
+        downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void = { _, _, _ in },
+        coreMLMode: CoreMLExecutionMode
+    ) async throws -> HeadlessResult {
         return try await Task.detached(priority: .userInitiated) {
             let executable = try PathResolver.swiftWhisperExecutable()
-            log("headless 啟動：preset=\(modelPreset.rawValue) language=\(language) diarize=\(diarize) file=\((filePath as NSString).lastPathComponent)")
+            log("headless 啟動：preset=\(modelPreset.rawValue) language=\(language) diarize=\(diarize) coreMLMode=\(coreMLMode.rawValue) file=\((filePath as NSString).lastPathComponent)")
 
             let process = Process()
             process.executableURL = executable
-            process.arguments = diarize ? [filePath, language, "--diarize"] : [filePath, language]
+            var arguments = [filePath, language]
+            if diarize {
+                arguments.append("--diarize")
+            }
+            if !coreMLMode.usesCoreML {
+                arguments.append("--no-coreml")
+            }
+            process.arguments = arguments
 
             var environment = ProcessInfo.processInfo.environment
             environment["SCRIBBY_SWIFTWHISPER_MODEL_DIR"] = modelDir.path
             environment["SCRIBBY_SWIFTWHISPER_MODEL_PRESET"] = modelPreset.rawValue
             environment["SCRIBBY_SWIFTWHISPER_MODEL_FILENAME"] = modelPreset.filename
             environment["SCRIBBY_SWIFTWHISPER_MODEL_URL"] = modelPreset.remoteURL
+            if let computeUnits = coreMLMode.environmentValue {
+                environment["SCRIBBY_COREML_COMPUTE_UNITS"] = computeUnits
+            } else {
+                environment.removeValue(forKey: "SCRIBBY_COREML_COMPUTE_UNITS")
+            }
             if let ffmpeg = PathResolver.ffmpegBinary() {
                 environment["SCRIBBY_FFMPEG"] = ffmpeg.path
             }
@@ -102,8 +359,9 @@ enum TranscriptionPipelineRunner {
 
             let stdoutHandle = stdout.fileHandleForReading
             let streamCollector = StreamCollector()
-            let stdoutEOF = DispatchSemaphore(value: 0)
-            let stderrEOF = DispatchSemaphore(value: 0)
+            let stdoutEOF = EOFWaiter()
+            let stderrEOF = EOFWaiter()
+            let executionState = HeadlessExecutionState()
 
             stdoutHandle.readabilityHandler = { handle in
                 let data = handle.availableData
@@ -119,6 +377,7 @@ enum TranscriptionPipelineRunner {
                           let lineData = line.data(using: .utf8) else { continue }
                     if let envelope = try? decoder.decode(HeadlessStreamEnvelope.self, from: lineData),
                        let streamEvent = envelope.toEvent() {
+                        executionState.stopCoreMLWatchdog()
                         if case .completed(let result) = streamEvent {
                             streamCollector.setCompletedResult(result)
                         }
@@ -151,20 +410,50 @@ enum TranscriptionPipelineRunner {
                     } else {
                         log(trimmed)
                     }
+                    executionState.noteCoreMLLogLine(trimmed)
                 }
             }
 
             try process.run()
             await processSupervisor.register(pid: process.processIdentifier, for: .headless)
+            if coreMLMode.usesCoreML {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    while !executionState.isProcessFinished() {
+                        Thread.sleep(forTimeInterval: 1)
+                        guard executionState.shouldTriggerCoreMLTimeout(after: coreMLMode.loadTimeout) else { continue }
+                        let error = NSError(
+                            domain: "SwiftWhisperProvider",
+                            code: coreMLStallErrorCode,
+                            userInfo: [NSLocalizedDescriptionKey: "\(modelPreset.displayName) 的 \(coreMLMode.displayName) Core ML encoder 載入逾時，已停止本次嘗試"]
+                        )
+                        guard executionState.setCoreMLStallErrorIfNeeded(error) else { return }
+                        log("偵測到 \(coreMLMode.displayName) Core ML encoder 載入逾時（\(Int(coreMLMode.loadTimeout)) 秒），正在中止 headless process")
+                        process.interrupt()
+                        Thread.sleep(forTimeInterval: 0.5)
+                        if process.isRunning {
+                            process.terminate()
+                        }
+                        for _ in 0..<10 {
+                            if !process.isRunning { return }
+                            Thread.sleep(forTimeInterval: 0.1)
+                        }
+                        if process.isRunning {
+                            kill(process.processIdentifier, SIGKILL)
+                        }
+                        return
+                    }
+                }
+            }
             process.waitUntilExit()
+            executionState.markProcessFinished()
             await processSupervisor.clear(.headless, matching: process.processIdentifier)
             log("headless 結束：exit=\(process.terminationStatus) file=\((filePath as NSString).lastPathComponent)")
 
             // Wait for EOF on both pipes — ensures all in-flight
             // readabilityHandler callbacks have finished processing
             // before we check completedResult.
-            stdoutEOF.wait()
-            stderrEOF.wait()
+            await stdoutEOF.wait()
+            await stderrEOF.wait()
             stdoutHandle.readabilityHandler = nil
             stderrHandle.readabilityHandler = nil
 
@@ -184,6 +473,10 @@ enum TranscriptionPipelineRunner {
                         event(streamEvent)
                     }
                 }
+            }
+
+            if let stallError = executionState.coreMLStallError() {
+                throw stallError
             }
 
             guard process.terminationStatus == 0 else {
@@ -418,7 +711,9 @@ enum TranscriptionPipelineRunner {
         result: HeadlessResult,
         mode: ProofreadingMode,
         processSupervisor: ProcessSupervisor,
-        log: @escaping @Sendable (String) -> Void
+        log: @escaping @Sendable (String) -> Void,
+        progress: @escaping @Sendable (ProofreadProgress) -> Void = { _ in },
+        streamedText: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws -> HeadlessResult {
         guard mode != .off else { return result }
 
@@ -468,7 +763,13 @@ enum TranscriptionPipelineRunner {
                 collectedStderr.append(text)
                 for line in text.split(whereSeparator: \.isNewline) {
                     let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty { log(trimmed) }
+                    guard !trimmed.isEmpty else { continue }
+                    if let proofreadProgress = parseProofreadProgressLine(trimmed) {
+                        progress(proofreadProgress)
+                    } else if let proofreadText = parseProofreadTextLine(trimmed) {
+                        streamedText(proofreadText)
+                    }
+                    log(trimmed)
                 }
             }
 
@@ -610,79 +911,391 @@ enum TranscriptionPipelineRunner {
         return "en"
     }
 
-    private static func syncCoreMLAssetsIfAvailable(
+    private static func prepareCoreMLAssetsIfAvailable(
         for modelPreset: WhisperModelPreset,
         into modelDir: URL,
+        preferredMode: CoreMLExecutionMode,
+        log: @escaping @Sendable (String) -> Void,
         downloadProgress: @escaping @Sendable (String, Int64, Int64) -> Void
-    ) async throws {
+    ) async throws -> CoreMLExecutionMode {
         let fileManager = FileManager.default
 
         let modelcName = modelPreset.filename.replacingOccurrences(of: ".bin", with: "-encoder.mlmodelc")
         let destinationModelc = modelDir.appendingPathComponent(modelcName, isDirectory: true)
-        let partialDestination = modelDir.appendingPathComponent(modelcName + ".downloading", isDirectory: true)
-
-        if fileManager.fileExists(atPath: partialDestination.path) {
-            try? fileManager.removeItem(at: partialDestination)
+        if fileManager.fileExists(atPath: destinationModelc.path) {
+            return try await selectValidatedCoreMLMode(
+                at: destinationModelc,
+                for: modelPreset,
+                preferredMode: preferredMode,
+                log: log
+            )
         }
-
-        if fileManager.fileExists(atPath: destinationModelc.path) { return }
 
         if let source = PathResolver.swiftWhisperCoreMLCompiledModel(named: modelcName) {
             try? fileManager.removeItem(at: destinationModelc)
             try fileManager.copyItem(at: source, to: destinationModelc)
-            return
+            log("[coreml-package] 使用現有 Core ML encoder：\(modelcName)")
+            return try await selectValidatedCoreMLMode(
+                at: destinationModelc,
+                for: modelPreset,
+                preferredMode: preferredMode,
+                log: log
+            )
         }
 
         let packageName = modelPreset.filename.replacingOccurrences(of: ".bin", with: "-encoder.mlpackage")
         let destinationPackage = modelDir.appendingPathComponent(packageName, isDirectory: true)
-        if fileManager.fileExists(atPath: destinationPackage.path) { return }
+        if fileManager.fileExists(atPath: destinationPackage.path) {
+            log("[coreml-package] 使用現有 encoder package：\(packageName)")
+            log("[coreml-compile] 正在編譯 Core ML encoder...")
+            try compileCoreMLPackage(at: destinationPackage, into: destinationModelc)
+            return try await selectValidatedCoreMLMode(
+                at: destinationModelc,
+                for: modelPreset,
+                preferredMode: preferredMode,
+                log: log
+            )
+        }
         if let source = PathResolver.swiftWhisperCoreMLPackage(named: packageName) {
             try? fileManager.removeItem(at: destinationPackage)
             try fileManager.copyItem(at: source, to: destinationPackage)
-            return
+            log("[coreml-package] 找到本機 Core ML encoder package：\(packageName)")
+            log("[coreml-compile] 正在編譯 Core ML encoder...")
+            try compileCoreMLPackage(at: destinationPackage, into: destinationModelc)
+            return try await selectValidatedCoreMLMode(
+                at: destinationModelc,
+                for: modelPreset,
+                preferredMode: preferredMode,
+                log: log
+            )
         }
 
-        guard let remoteURL = modelPreset.coreMLEncoderRemoteURL else { return }
+        switch modelPreset.coreMLEncoderProvisioning {
+        case .none:
+            return .disabled
+        case .compiledArchive:
+            guard let remoteURL = modelPreset.remoteCompiledCoreMLArchiveURL else { return .disabled }
+            let partialDestination = modelDir.appendingPathComponent(modelcName + ".downloading", isDirectory: true)
+            if fileManager.fileExists(atPath: partialDestination.path) {
+                try? fileManager.removeItem(at: partialDestination)
+            }
 
-        let zipFilename = "\(modelcName).zip"
-        let tempZip = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("zip")
+            let zipFilename = "\(modelcName).zip"
+            let tempZip = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString)
+                .appendingPathExtension("zip")
 
-        try await downloadFile(from: remoteURL, to: tempZip, progressHandler: { downloaded, total in
-            downloadProgress(zipFilename, downloaded, total)
-        })
+            try await downloadFile(from: remoteURL, to: tempZip, progressHandler: { downloaded, total in
+                downloadProgress(zipFilename, downloaded, total)
+            })
 
-        defer { try? fileManager.removeItem(at: tempZip) }
+            defer { try? fileManager.removeItem(at: tempZip) }
 
-        let tempExtract = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-        try fileManager.createDirectory(at: tempExtract, withIntermediateDirectories: true)
-        defer { try? fileManager.removeItem(at: tempExtract) }
+            let tempExtract = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString)
+            try fileManager.createDirectory(at: tempExtract, withIntermediateDirectories: true)
+            defer { try? fileManager.removeItem(at: tempExtract) }
 
-        try await Task.detached {
-            let unzip = Process()
-            unzip.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-            unzip.arguments = ["-o", tempZip.path, "-d", tempExtract.path]
-            unzip.standardOutput = FileHandle.nullDevice
-            unzip.standardError = FileHandle.nullDevice
-            try unzip.run()
-            unzip.waitUntilExit()
-            guard unzip.terminationStatus == 0 else {
+            try await Task.detached {
+                try extractZipArchive(at: tempZip, to: tempExtract, errorContext: "CoreML encoder 解壓失敗")
+            }.value
+
+            let extracted = tempExtract.appendingPathComponent(modelcName, isDirectory: true)
+            if fileManager.fileExists(atPath: extracted.path) {
+                try? fileManager.removeItem(at: partialDestination)
+                try fileManager.moveItem(at: extracted, to: partialDestination)
+                try? fileManager.removeItem(at: destinationModelc)
+                try fileManager.moveItem(at: partialDestination, to: destinationModelc)
+                return try await selectValidatedCoreMLMode(
+                    at: destinationModelc,
+                    for: modelPreset,
+                    preferredMode: preferredMode,
+                    log: log
+                )
+            }
+            return .disabled
+        case .packageFirst:
+            guard let remoteURL = modelPreset.remoteCoreMLPackageArchiveURL else {
+                log("[coreml-package] \(modelPreset.rawValue) 目前沒有可下載的 Core ML encoder package，改走 CPU-only")
+                return .disabled
+            }
+
+            let zipFilename = "\(packageName).zip"
+            let tempZip = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString)
+                .appendingPathExtension("zip")
+
+            log("[coreml-package] 正在下載 encoder package...")
+            try await downloadFile(from: remoteURL, to: tempZip, progressHandler: { downloaded, total in
+                downloadProgress(zipFilename, downloaded, total)
+            })
+
+            defer { try? fileManager.removeItem(at: tempZip) }
+
+            let tempExtract = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString)
+            try fileManager.createDirectory(at: tempExtract, withIntermediateDirectories: true)
+            defer { try? fileManager.removeItem(at: tempExtract) }
+
+            try await Task.detached {
+                try extractZipArchive(at: tempZip, to: tempExtract, errorContext: "CoreML encoder package 解壓失敗")
+            }.value
+
+            let extracted = tempExtract.appendingPathComponent(packageName, isDirectory: true)
+            guard fileManager.fileExists(atPath: extracted.path) else {
+                log("[coreml-package] 找不到解壓後的 encoder package，改走 CPU-only")
+                return .disabled
+            }
+
+            try? fileManager.removeItem(at: destinationPackage)
+            try fileManager.moveItem(at: extracted, to: destinationPackage)
+            log("[coreml-compile] 正在編譯 Core ML encoder...")
+            try compileCoreMLPackage(at: destinationPackage, into: destinationModelc)
+            return try await selectValidatedCoreMLMode(
+                at: destinationModelc,
+                for: modelPreset,
+                preferredMode: preferredMode,
+                log: log
+            )
+        }
+    }
+
+    private static func selectValidatedCoreMLMode(
+        at modelcURL: URL,
+        for modelPreset: WhisperModelPreset,
+        preferredMode: CoreMLExecutionMode,
+        log: @escaping @Sendable (String) -> Void
+    ) async throws -> CoreMLExecutionMode {
+        guard preferredMode.usesCoreML else { return .disabled }
+
+        if try await validatePreparedCoreMLModel(
+            at: modelcURL,
+            for: modelPreset,
+            mode: preferredMode,
+            log: log
+        ) {
+            return preferredMode
+        }
+
+        if preferredMode == .cpuAndNe {
+            CoreMLEncoderSessionRegistry.shared.disableNe(modelPreset)
+            log("[coreml-load] CPU_AND_NE 驗證未通過，改試 CPU_AND_GPU")
+            if try await validatePreparedCoreMLModel(
+                at: modelcURL,
+                for: modelPreset,
+                mode: .cpuAndGpu,
+                log: log
+            ) {
+                return .cpuAndGpu
+            }
+        }
+
+        CoreMLEncoderSessionRegistry.shared.disable(modelPreset)
+        return .disabled
+    }
+
+    private static func validatePreparedCoreMLModel(
+        at modelcURL: URL,
+        for modelPreset: WhisperModelPreset,
+        mode: CoreMLExecutionMode,
+        log: @escaping @Sendable (String) -> Void
+    ) async throws -> Bool {
+        guard mode.usesCoreML else { return false }
+        if CoreMLEncoderSessionRegistry.shared.isValidated(modelPreset, mode: mode) {
+            return true
+        }
+
+        let loadStart = Date()
+        log("[coreml-load] 正在驗證 \(mode.displayName) Core ML encoder 載入...")
+
+        do {
+            try await validateCoreMLModelLoad(
+                at: modelcURL,
+                timeout: mode.loadTimeout,
+                computeUnits: mode
+            )
+            let duration = Date().timeIntervalSince(loadStart)
+            log(String(format: "[coreml-load] %@ 載入驗證成功（%.1f 秒）", mode.displayName, duration))
+            CoreMLEncoderSessionRegistry.shared.markValidated(modelPreset, mode: mode)
+            return true
+        } catch {
+            let duration = Date().timeIntervalSince(loadStart)
+            log(String(format: "[coreml-load] %@ 載入驗證失敗（%.1f 秒）：%@", mode.displayName, duration, error.localizedDescription))
+            try purgeCoreMLAssets(for: modelPreset, into: modelcURL.deletingLastPathComponent(), log: log)
+            CoreMLEncoderSessionRegistry.shared.clearValidation(modelPreset, mode: mode)
+            return false
+        }
+    }
+
+    private static func compileCoreMLPackage(at packageURL: URL, into destinationModelc: URL) throws {
+        let outputDirectory = destinationModelc.deletingLastPathComponent()
+        let compiledName = packageURL.deletingPathExtension().lastPathComponent + ".mlmodelc"
+        let compiledURL = outputDirectory.appendingPathComponent(compiledName, isDirectory: true)
+        let compilerURL = try PathResolver.coreMLCompilerExecutable()
+        try? FileManager.default.removeItem(at: compiledURL)
+        try? FileManager.default.removeItem(at: destinationModelc)
+
+        let compile = Process()
+        compile.executableURL = compilerURL
+        compile.arguments = ["compile", packageURL.path, outputDirectory.path]
+        compile.standardOutput = FileHandle.nullDevice
+        compile.standardError = FileHandle.nullDevice
+        try compile.run()
+        compile.waitUntilExit()
+        guard compile.terminationStatus == 0 else {
+            throw NSError(
+                domain: "SwiftWhisperProvider",
+                code: Int(compile.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: "Core ML encoder 編譯失敗"]
+            )
+        }
+
+        guard FileManager.default.fileExists(atPath: compiledURL.path) else {
+            throw NSError(
+                domain: "SwiftWhisperProvider",
+                code: 73_001,
+                userInfo: [NSLocalizedDescriptionKey: "Core ML encoder 編譯後找不到輸出檔"]
+            )
+        }
+        try FileManager.default.moveItem(at: compiledURL, to: destinationModelc)
+    }
+
+    private static func extractZipArchive(at zipURL: URL, to destinationDirectory: URL, errorContext: String) throws {
+        let tryCommands: [(URL, [String])] = [
+            (URL(fileURLWithPath: "/usr/bin/ditto"), ["-x", "-k", zipURL.path, destinationDirectory.path]),
+            (URL(fileURLWithPath: "/usr/bin/unzip"), ["-o", zipURL.path, "-d", destinationDirectory.path]),
+        ]
+
+        var failureMessages: [String] = []
+
+        for (executableURL, arguments) in tryCommands {
+            guard FileManager.default.fileExists(atPath: executableURL.path) else { continue }
+
+            let process = Process()
+            process.executableURL = executableURL
+            process.arguments = arguments
+            process.standardOutput = FileHandle.nullDevice
+
+            let stderr = Pipe()
+            process.standardError = stderr
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+            } catch {
+                failureMessages.append("\(executableURL.lastPathComponent): \(error.localizedDescription)")
+                continue
+            }
+
+            if process.terminationStatus == 0 {
+                return
+            }
+
+            let stderrText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let message = stderrText?.isEmpty == false
+                ? stderrText!
+                : "exit \(process.terminationStatus)"
+            failureMessages.append("\(executableURL.lastPathComponent): \(message)")
+        }
+
+        throw NSError(
+            domain: "SwiftWhisperProvider",
+            code: 73_101,
+            userInfo: [NSLocalizedDescriptionKey: "\(errorContext)（\(failureMessages.joined(separator: " | "))）"]
+        )
+    }
+
+    private static func validateCoreMLModelLoad(
+        at modelcURL: URL,
+        timeout: TimeInterval,
+        computeUnits: CoreMLExecutionMode
+    ) async throws {
+        try await Task.detached(priority: .userInitiated) {
+            let diagnoseExecutable = try PathResolver.swiftWhisperCoreMLDiagnoseExecutable()
+
+            let process = Process()
+            process.executableURL = diagnoseExecutable
+            process.arguments = [
+                "--load-only",
+                modelcURL.path,
+                "--compute-units",
+                computeUnits.rawValue
+            ]
+
+            let stderr = Pipe()
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = stderr
+
+            try process.run()
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                Thread.sleep(forTimeInterval: timeout)
+                guard process.isRunning else { return }
+                process.interrupt()
+                Thread.sleep(forTimeInterval: 0.5)
+                if process.isRunning {
+                    process.terminate()
+                }
+                Thread.sleep(forTimeInterval: 0.5)
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
+            }
+
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else {
+                let errorText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if process.terminationReason == .uncaughtSignal {
+                    throw NSError(
+                        domain: "SwiftWhisperProvider",
+                        code: coreMLStallErrorCode,
+                        userInfo: [NSLocalizedDescriptionKey: "\(computeUnits.displayName) Core ML encoder 載入驗證逾時"]
+                    )
+                }
+
                 throw NSError(
                     domain: "SwiftWhisperProvider",
-                    code: Int(unzip.terminationStatus),
-                    userInfo: [NSLocalizedDescriptionKey: "CoreML encoder 解壓失敗"]
+                    code: Int(process.terminationStatus),
+                    userInfo: [NSLocalizedDescriptionKey: errorText?.isEmpty == false ? errorText! : "\(computeUnits.displayName) Core ML encoder 載入驗證失敗"]
                 )
             }
         }.value
+    }
 
-        let extracted = tempExtract.appendingPathComponent(modelcName, isDirectory: true)
-        if fileManager.fileExists(atPath: extracted.path) {
-            try? fileManager.removeItem(at: partialDestination)
-            try fileManager.moveItem(at: extracted, to: partialDestination)
-            try? fileManager.removeItem(at: destinationModelc)
-            try fileManager.moveItem(at: partialDestination, to: destinationModelc)
+    private static func preferredCoreMLExecutionMode(for modelPreset: WhisperModelPreset) -> CoreMLExecutionMode {
+        switch modelPreset {
+        case .tiny:
+            return .disabled
+        case .largeV3Turbo:
+            return .cpuAndNe
+        case .largeV3:
+            return .cpuAndNe
+        }
+    }
+
+    private static func purgeCoreMLAssets(
+        for modelPreset: WhisperModelPreset,
+        into modelDir: URL,
+        removePackage: Bool = false,
+        log: @escaping @Sendable (String) -> Void
+    ) throws {
+        let fileManager = FileManager.default
+        let modelcName = modelPreset.filename.replacingOccurrences(of: ".bin", with: "-encoder.mlmodelc")
+        let packageName = modelPreset.filename.replacingOccurrences(of: ".bin", with: "-encoder.mlpackage")
+        let modelcURL = modelDir.appendingPathComponent(modelcName, isDirectory: true)
+        let packageURL = modelDir.appendingPathComponent(packageName, isDirectory: true)
+
+        if fileManager.fileExists(atPath: modelcURL.path) {
+            try? fileManager.removeItem(at: modelcURL)
+            log("已移除 encoder 快取：\(modelcName)")
+            CoreMLEncoderSessionRegistry.shared.clearValidation(modelPreset)
+        }
+        if removePackage, fileManager.fileExists(atPath: packageURL.path) {
+            try? fileManager.removeItem(at: packageURL)
+            log("已移除 encoder 套件：\(packageName)")
         }
     }
 
@@ -803,6 +1416,56 @@ enum TranscriptionPipelineRunner {
             }
         }
     }
+}
+
+enum ProofreadProgressPhase: String {
+    case start
+    case done
+    case finished
+}
+
+struct ProofreadProgress {
+    let currentBatch: Int
+    let totalBatches: Int
+    let phase: ProofreadProgressPhase
+}
+
+private func parseProofreadProgressLine(_ line: String) -> ProofreadProgress? {
+    guard line.hasPrefix("PROOFREAD_PROGRESS ") else { return nil }
+    let payload = line.dropFirst("PROOFREAD_PROGRESS ".count)
+    var currentBatch: Int?
+    var totalBatches: Int?
+    var phase: ProofreadProgressPhase?
+
+    for token in payload.split(separator: " ") {
+        let parts = token.split(separator: "=", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { continue }
+        switch parts[0] {
+        case "current":
+            currentBatch = Int(parts[1])
+        case "total":
+            totalBatches = Int(parts[1])
+        case "phase":
+            phase = ProofreadProgressPhase(rawValue: parts[1])
+        default:
+            break
+        }
+    }
+
+    guard let currentBatch,
+          let totalBatches,
+          let phase else { return nil }
+    return ProofreadProgress(currentBatch: currentBatch, totalBatches: totalBatches, phase: phase)
+}
+
+private func parseProofreadTextLine(_ line: String) -> String? {
+    guard line.hasPrefix("PROOFREAD_TEXT ") else { return nil }
+    let payload = line.dropFirst("PROOFREAD_TEXT ".count)
+    guard let data = payload.data(using: .utf8),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let text = object["text"] as? String else { return nil }
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
 }
 
 private final class StderrCollector: @unchecked Sendable {
@@ -930,6 +1593,171 @@ private final class StreamCollector: @unchecked Sendable {
         lock.withLock {
             history.suffix(maxLines).joined(separator: "\n")
         }
+    }
+}
+
+private final class EOFWaiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didSignal = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func signal() {
+        var pending: CheckedContinuation<Void, Never>?
+        lock.lock()
+        if didSignal {
+            lock.unlock()
+            return
+        }
+        didSignal = true
+        pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume()
+    }
+
+    func wait() async {
+        let alreadySignaled = lock.withLock { didSignal }
+        if alreadySignaled { return }
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if didSignal {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+}
+
+private final class CoreMLEncoderSessionRegistry: @unchecked Sendable {
+    static let shared = CoreMLEncoderSessionRegistry()
+
+    private let lock = NSLock()
+    private var disabledPresets: Set<String> = []
+    private var neDisabledPresets: Set<String> = []
+    private var validatedModes: [String: Set<String>] = [:]
+
+    func isDisabled(_ preset: WhisperModelPreset) -> Bool {
+        lock.withLock { disabledPresets.contains(preset.rawValue) }
+    }
+
+    func disable(_ preset: WhisperModelPreset) {
+        lock.withLock {
+            disabledPresets.insert(preset.rawValue)
+            neDisabledPresets.insert(preset.rawValue)
+            validatedModes.removeValue(forKey: preset.rawValue)
+        }
+    }
+
+    func isNeDisabled(_ preset: WhisperModelPreset) -> Bool {
+        lock.withLock { neDisabledPresets.contains(preset.rawValue) }
+    }
+
+    func disableNe(_ preset: WhisperModelPreset) {
+        lock.withLock {
+            neDisabledPresets.insert(preset.rawValue)
+            validatedModes[preset.rawValue]?.remove(CoreMLExecutionMode.cpuAndNe.rawValue)
+        }
+    }
+
+    func isValidated(_ preset: WhisperModelPreset, mode: CoreMLExecutionMode) -> Bool {
+        lock.withLock { validatedModes[preset.rawValue]?.contains(mode.rawValue) == true }
+    }
+
+    func markValidated(_ preset: WhisperModelPreset, mode: CoreMLExecutionMode) {
+        lock.withLock {
+            disabledPresets.remove(preset.rawValue)
+            validatedModes[preset.rawValue, default: []].insert(mode.rawValue)
+            if mode == .cpuAndNe {
+                neDisabledPresets.remove(preset.rawValue)
+            }
+        }
+    }
+
+    func clearValidation(_ preset: WhisperModelPreset, mode: CoreMLExecutionMode) {
+        lock.withLock {
+            validatedModes[preset.rawValue]?.remove(mode.rawValue)
+            if validatedModes[preset.rawValue]?.isEmpty == true {
+                validatedModes.removeValue(forKey: preset.rawValue)
+            }
+        }
+    }
+
+    func clearValidation(_ preset: WhisperModelPreset) {
+        _ = lock.withLock {
+            validatedModes.removeValue(forKey: preset.rawValue)
+        }
+    }
+}
+
+private final class HeadlessExecutionState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var coreMLLoading = false
+    private var lastCoreMLActivityAt: Date?
+    private var processFinished = false
+    private var stallError: NSError?
+
+    func noteCoreMLLogLine(_ line: String) {
+        lock.withLock {
+            if line.contains("loading Core ML model from") {
+                coreMLLoading = true
+                lastCoreMLActivityAt = Date()
+                return
+            }
+
+            guard coreMLLoading else { return }
+
+            lastCoreMLActivityAt = Date()
+            if line.contains("whisper_full_with_state:") ||
+                line.contains("auto-detected language") ||
+                line.contains("completed event flushed") {
+                coreMLLoading = false
+                lastCoreMLActivityAt = nil
+            }
+        }
+    }
+
+    func stopCoreMLWatchdog() {
+        lock.withLock {
+            coreMLLoading = false
+            lastCoreMLActivityAt = nil
+        }
+    }
+
+    func shouldTriggerCoreMLTimeout(after timeout: TimeInterval) -> Bool {
+        lock.withLock {
+            guard coreMLLoading, let lastCoreMLActivityAt else { return false }
+            return Date().timeIntervalSince(lastCoreMLActivityAt) >= timeout
+        }
+    }
+
+    func setCoreMLStallErrorIfNeeded(_ error: NSError) -> Bool {
+        lock.withLock {
+            guard stallError == nil else { return false }
+            stallError = error
+            coreMLLoading = false
+            lastCoreMLActivityAt = nil
+            return true
+        }
+    }
+
+    func coreMLStallError() -> NSError? {
+        lock.withLock { stallError }
+    }
+
+    func markProcessFinished() {
+        lock.withLock {
+            processFinished = true
+            coreMLLoading = false
+            lastCoreMLActivityAt = nil
+        }
+    }
+
+    func isProcessFinished() -> Bool {
+        lock.withLock { processFinished }
     }
 }
 

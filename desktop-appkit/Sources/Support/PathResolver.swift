@@ -175,6 +175,53 @@ enum PathResolver {
         return parts[0] == 3 && parts[1] == 12
     }
 
+    // MARK: - Core ML tools
+
+    static func coreMLCompilerExecutable() throws -> URL {
+        let fileManager = FileManager.default
+
+        if let discovered = try? resolveCoreMLCompilerWithXcrun(),
+           fileManager.isExecutableFile(atPath: discovered.path) {
+            return discovered
+        }
+
+        let candidates = [
+            "/Applications/Xcode.app/Contents/Developer/usr/bin/coremlc",
+            "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/coremlc",
+        ]
+
+        for candidate in candidates where fileManager.isExecutableFile(atPath: candidate) {
+            return URL(fileURLWithPath: candidate, isDirectory: false)
+        }
+
+        throw ResolverError.missingPath("找不到 coremlc，請安裝 Xcode，或將 xcode-select 指到 Xcode.app")
+    }
+
+    private static func resolveCoreMLCompilerWithXcrun() throws -> URL {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
+        process.arguments = ["--find", "coremlc"]
+
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            throw ResolverError.missingPath("xcrun 找不到 coremlc")
+        }
+
+        let path = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !path.isEmpty else {
+            throw ResolverError.missingPath("xcrun 沒有回傳 coremlc 路徑")
+        }
+
+        return URL(fileURLWithPath: path, isDirectory: false)
+    }
+
     // MARK: - Scripts
 
     static func diarizationHelperScript() throws -> URL {
@@ -234,6 +281,21 @@ enum PathResolver {
         }
 
         throw ResolverError.missingPath("找不到 SwiftWhisper headless 執行檔")
+    }
+
+    static func swiftWhisperCoreMLDiagnoseExecutable() throws -> URL {
+        if let bundled = Bundle.main.resourceURL?.appendingPathComponent("bin/scribby-coreml-diagnose"),
+           FileManager.default.isExecutableFile(atPath: bundled.path) {
+            return bundled
+        }
+
+        if let dev = devRepoRoot()?
+            .appendingPathComponent("desktop-appkit/swiftwhisper-core/.build/arm64-apple-macosx/release/scribby-coreml-diagnose"),
+           FileManager.default.isExecutableFile(atPath: dev.path) {
+            return dev
+        }
+
+        throw ResolverError.missingPath("找不到 SwiftWhisper Core ML diagnose 執行檔")
     }
 
     // MARK: - Models

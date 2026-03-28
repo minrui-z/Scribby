@@ -7,8 +7,10 @@ venv/
 .env
 desktop-appkit/.venv/
 desktop-appkit/.venv-coreml/
+desktop-appkit/.venv-*/
 desktop-appkit/.build/
 desktop-appkit/build/
+desktop-appkit/coreml-matrix-results/
 desktop-appkit/probe/
 desktop-appkit/python/__pycache__/
 desktop-appkit/swiftwhisper-core/.build/

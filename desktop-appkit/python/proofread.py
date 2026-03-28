@@ -81,6 +81,11 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
+def _log_json(prefix: str, payload: dict) -> None:
+    sys.stderr.write(prefix + " " + json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stderr.flush()
+
+
 def _error(msg: str, code: int = 1) -> None:
     _log(msg)
     sys.exit(code)
@@ -275,6 +280,10 @@ def proofread_batch(model, tokenizer, generate_fn, sampler, all_segs, batch_star
 # ────────────────────────────────────────────────
 
 def main() -> None:
+    if "--warmup" in sys.argv[1:]:
+        load_model()
+        return
+
     raw = sys.stdin.read()
     if not raw.strip():
         _error("stdin 為空", code=1)
@@ -308,14 +317,28 @@ def main() -> None:
 
     results: list[dict] = list(segments)  # 複製，保留原始結構
     total = len(segments)
+    total_batches = max((total + BATCH_SIZE - 1) // BATCH_SIZE, 1)
     i = 0
     while i < total:
         batch_end = min(i + BATCH_SIZE, total)
+        batch_number = i // BATCH_SIZE + 1
+        _log(f"PROOFREAD_PROGRESS current={batch_number} total={total_batches} phase=start")
         corrected_texts = proofread_batch(model, tokenizer, generate_fn, sampler, segments, i, batch_end, mode, language, is_simplified)
         for j, text in enumerate(corrected_texts):
             results[i + j] = {"text": text}
+        _log_json(
+            "PROOFREAD_TEXT",
+            {
+                "current": batch_number,
+                "total": total_batches,
+                "text": "\n".join(t for t in corrected_texts if t.strip()),
+            },
+        )
+        _log(f"PROOFREAD_PROGRESS current={batch_number} total={total_batches} phase=done")
         _log(f"校稿進度：{batch_end}/{total} 段")
         i = batch_end
+
+    _log(f"PROOFREAD_PROGRESS current={total_batches} total={total_batches} phase=finished")
 
     sys.stdout.write(json.dumps({"segments": results}, ensure_ascii=False) + "\n")
     sys.stdout.flush()

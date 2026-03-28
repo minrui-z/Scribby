@@ -48,7 +48,6 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     }
 
     func verifyToken(_ token: String) async throws -> TokenVerificationResult {
-        try await PythonEnvironmentManager.shared.ensureReady(for: .diarization) { _ in }
         return try await TranscriptionPipelineRunner.verifyHuggingFaceToken(token)
     }
 
@@ -67,6 +66,52 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         onEvent?(.queueUpdated(snapshot))
         startWorker(for: request)
         return snapshot
+    }
+
+    func prepareAdvancedFeatures(
+        modelPreset: WhisperModelPreset,
+        enhancement: Bool,
+        diarization: Bool,
+        proofreading: Bool,
+        log: @escaping @Sendable (String) -> Void
+    ) async throws {
+        try await TranscriptionPipelineRunner.prepareWhisperAssets(
+            modelPreset: modelPreset,
+            log: log,
+            downloadProgress: { _, _, _ in }
+        )
+
+        let selectedGroups: [PythonDependencyGroup] = [
+            enhancement ? .enhancement : nil,
+            diarization ? .diarization : nil,
+            proofreading ? .proofreading : nil,
+        ].compactMap { $0 }
+
+        guard !selectedGroups.isEmpty else { return }
+
+        for group in selectedGroups {
+            log("正在建立\(group.label)環境...")
+            try await PythonEnvironmentManager.shared.ensureReady(
+                for: group,
+                log: { message in
+                    log(message)
+                }
+            )
+
+            if group == .proofreading {
+                log("正在準備 AI 校稿模型...")
+                try await TranscriptionPipelineRunner.prepareProofreadingAssets { message in
+                    if message.contains("正在載入 AI 校稿模型") ||
+                        message.contains("正在下載 AI 校稿模型") ||
+                        message.contains("AI 校稿模型已就緒") {
+                        log(message)
+                    }
+                }
+                log("AI 校稿已就緒")
+            } else {
+                log("\(group.label)已就緒")
+            }
+        }
     }
 
     func setPaused(_ paused: Bool) async throws -> ProviderSnapshot {
@@ -411,7 +456,17 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                     do {
                         try await PythonEnvironmentManager.shared.ensureReady(
                             for: .proofreading,
-                            log: { line in DebugLogger.shared.write("[proofread-env] \(line)") },
+                            log: { [weak self] line in
+                                DebugLogger.shared.write("[proofread-env] \(line)")
+                                Task { @MainActor in
+                                    self?.handleProofreadingEnvironmentLog(
+                                        line,
+                                        fileId: item.fileId,
+                                        itemIndex: index,
+                                        activePhases: activePhases
+                                    )
+                                }
+                            },
                             pipProgress: { [weak self] info in
                                 Task { @MainActor in
                                     guard let self else { return }
@@ -432,7 +487,31 @@ final class SwiftWhisperProvider: TranscriptionProvider {
                             result: finalResult,
                             mode: request.proofreadingMode,
                             processSupervisor: processSupervisor,
-                            log: { line in DebugLogger.shared.write("[proofread] \(line)") }
+                            log: { [weak self] line in
+                                DebugLogger.shared.write("[proofread] \(line)")
+                                Task { @MainActor in
+                                    self?.handleProofreadingRuntimeLog(
+                                        line,
+                                        fileId: item.fileId,
+                                        itemIndex: index
+                                    )
+                                }
+                            },
+                            progress: { [weak self] update in
+                                Task { @MainActor in
+                                    guard let self else { return }
+                                    self.handleProofreadingProgress(
+                                        update,
+                                        fileId: item.fileId,
+                                        itemIndex: index
+                                    )
+                                }
+                            },
+                            streamedText: { [weak self] text in
+                                Task { @MainActor in
+                                    self?.onEvent?(.taskPartialText(fileId: item.fileId, text: text))
+                                }
+                            }
                         )
                         DebugLogger.shared.write("[proofread] done segments=\(proofreadResult.segments.count)")
                     } catch {
@@ -513,6 +592,33 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         onEvent?(.queueUpdated(snapshot))
     }
 
+    private func handleProofreadingRuntimeLog(_ line: String, fileId: String, itemIndex: Int) {
+        guard itemIndex < snapshot.items.count else { return }
+
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let visibleMessage: String?
+        if trimmed.contains("正在載入 AI 校稿模型") {
+            visibleMessage = "正在準備 AI 校稿模型..."
+        } else if trimmed.contains("首次使用會自動下載約") {
+            visibleMessage = trimmed
+        } else if trimmed.contains("Fetching ") {
+            visibleMessage = "正在下載 AI 校稿模型..."
+        } else if trimmed.contains("AI 校稿模型已就緒") {
+            visibleMessage = "AI 校稿模型已就緒"
+        } else {
+            visibleMessage = nil
+        }
+
+        guard let visibleMessage else { return }
+        snapshot.items[itemIndex].phase = .proofreading
+        snapshot.items[itemIndex].message = visibleMessage
+        syncInfo()
+        onEvent?(.taskProgress(fileId: fileId, message: visibleMessage, progress: 88))
+        onEvent?(.queueUpdated(snapshot))
+    }
+
     private func handlePipProgress(_ info: PipDownloadInfo, fileId: String, itemIndex: Int, activePhases: [ProcessingPhase]) {
         guard itemIndex < snapshot.items.count else { return }
 
@@ -574,6 +680,60 @@ final class SwiftWhisperProvider: TranscriptionProvider {
         case .failed(let message):
             onEvent?(.taskLog(fileId: fileId, message: message))
         }
+    }
+
+    private func handleProofreadingProgress(_ update: ProofreadProgress, fileId: String, itemIndex: Int) {
+        guard itemIndex < snapshot.items.count else { return }
+
+        let message = proofreadingProgressMessage(for: update)
+        let progress = proofreadingProgressValue(for: update)
+        snapshot.items[itemIndex].phase = .proofreading
+        snapshot.items[itemIndex].message = message
+        snapshot.items[itemIndex].progress = max(snapshot.items[itemIndex].progress, progress)
+        syncInfo()
+        onEvent?(.taskProgress(fileId: fileId, message: message, progress: progress))
+
+        onEvent?(.queueUpdated(snapshot))
+    }
+
+    private func handleProofreadingEnvironmentLog(
+        _ line: String,
+        fileId: String,
+        itemIndex: Int,
+        activePhases: [ProcessingPhase]
+    ) {
+        guard itemIndex < snapshot.items.count else { return }
+
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let visibleMessage: String?
+        if trimmed.contains("找不到 Python 3.12.x，正在下載獨立 Python 環境") {
+            visibleMessage = "正在下載 Python 3.12.8..."
+        } else if trimmed.contains("正在下載 Python") {
+            visibleMessage = trimmed
+        } else if trimmed.contains("Python 3.12.8 安裝完成") {
+            visibleMessage = "獨立 Python 已就緒"
+        } else if trimmed.contains("正在建立 Python 虛擬環境") {
+            visibleMessage = "正在建立 AI 校稿環境..."
+        } else if trimmed.contains("正在升級 pip") {
+            visibleMessage = "正在準備 AI 校稿依賴..."
+        } else if trimmed.contains("正在安裝AI 校稿所需的 Python 套件")
+                    || trimmed.contains("正在安裝 AI 校稿所需的 Python 套件") {
+            visibleMessage = "正在安裝 AI 校稿依賴..."
+        } else if trimmed.contains("AI 校稿環境就緒") {
+            visibleMessage = "AI 校稿環境已就緒"
+        } else {
+            visibleMessage = nil
+        }
+
+        guard let visibleMessage else { return }
+        snapshot.items[itemIndex].phase = .downloading
+        snapshot.items[itemIndex].activePhases = activePhases
+        snapshot.items[itemIndex].message = visibleMessage
+        syncInfo()
+        onEvent?(.taskProgress(fileId: fileId, message: visibleMessage, progress: 82))
+        onEvent?(.queueUpdated(snapshot))
     }
 
     @discardableResult
@@ -669,6 +829,37 @@ final class SwiftWhisperProvider: TranscriptionProvider {
     private func chunkProgressValue(for state: ChunkedTaskState) -> Int {
         guard !state.prepared.chunks.isEmpty else { return 15 }
         return Int((Double(state.nextChunkIndex) / Double(state.prepared.chunks.count) * 100).rounded())
+    }
+
+    private func proofreadingProgressMessage(for update: ProofreadProgress) -> String {
+        guard update.totalBatches > 1 else {
+            return update.phase == .finished ? "AI 校稿即將完成..." : "正在 AI 校稿..."
+        }
+        switch update.phase {
+        case .start:
+            return "正在 AI 校稿第 \(update.currentBatch) / \(update.totalBatches) 批..."
+        case .done:
+            if update.currentBatch >= update.totalBatches {
+                return "AI 校稿即將完成..."
+            }
+            return "正在 AI 校稿第 \(min(update.currentBatch + 1, update.totalBatches)) / \(update.totalBatches) 批..."
+        case .finished:
+            return "AI 校稿即將完成..."
+        }
+    }
+
+    private func proofreadingProgressValue(for update: ProofreadProgress) -> Int {
+        guard update.totalBatches > 0 else { return 90 }
+        switch update.phase {
+        case .start:
+            let ratio = Double(max(update.currentBatch - 1, 0)) / Double(update.totalBatches)
+            return 90 + Int((ratio * 8).rounded())
+        case .done:
+            let ratio = Double(update.currentBatch) / Double(update.totalBatches)
+            return 90 + Int((ratio * 8).rounded())
+        case .finished:
+            return 99
+        }
     }
 
     private func cleanupChunkState(for fileId: String) async {

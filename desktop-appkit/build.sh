@@ -30,16 +30,36 @@ CPLUS_INCLUDE_PATH="$SDK_CXX_HEADERS" \
 /usr/bin/xcrun swift build \
   -c release \
   --package-path "$SWIFTWHISPER_PACKAGE_DIR" \
-  --product scribby-swiftwhisper-headless
+  --product scribby-swiftwhisper-headless \
+  --product scribby-coreml-diagnose
 
-HEADLESS_BIN="$(
+SWIFTWHISPER_BIN_DIR="$(
   CPLUS_INCLUDE_PATH="$SDK_CXX_HEADERS" \
   /usr/bin/xcrun swift build \
     -c release \
     --package-path "$SWIFTWHISPER_PACKAGE_DIR" \
     --product scribby-swiftwhisper-headless \
+    --product scribby-coreml-diagnose \
     --show-bin-path
-)/scribby-swiftwhisper-headless"
+)"
+HEADLESS_BIN="$SWIFTWHISPER_BIN_DIR/scribby-swiftwhisper-headless"
+DIAGNOSE_BIN="$SWIFTWHISPER_BIN_DIR/scribby-coreml-diagnose"
+
+if [[ ! -x "$HEADLESS_BIN" ]]; then
+  CPLUS_INCLUDE_PATH="$SDK_CXX_HEADERS" \
+  /usr/bin/xcrun swift build \
+    -c release \
+    --package-path "$SWIFTWHISPER_PACKAGE_DIR" \
+    --product scribby-swiftwhisper-headless
+fi
+
+if [[ ! -x "$DIAGNOSE_BIN" ]]; then
+  CPLUS_INCLUDE_PATH="$SDK_CXX_HEADERS" \
+  /usr/bin/xcrun swift build \
+    -c release \
+    --package-path "$SWIFTWHISPER_PACKAGE_DIR" \
+    --product scribby-coreml-diagnose
+fi
 
 /usr/bin/xcrun swiftc \
   -O \
@@ -58,6 +78,7 @@ mkdir -p "$BIN_DIR" "$RES_DIR/bin"
 mkdir -p "$RES_DIR/python"
 cp "$BUILD_DIR/ScribbyNative" "$BIN_DIR/"
 cp "$HEADLESS_BIN" "$RES_DIR/bin/"
+cp "$DIAGNOSE_BIN" "$RES_DIR/bin/"
 cp "$WORKSPACE/python/pyannote_diarize.py" "$RES_DIR/python/"
 cp "$WORKSPACE/python/speech_enhance.py" "$RES_DIR/python/"
 cp "$WORKSPACE/python/proofread.py" "$RES_DIR/python/"

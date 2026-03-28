@@ -15,6 +15,10 @@ let package = Package(
             name: "scribby-swiftwhisper-headless",
             targets: ["SwiftWhisperHeadless"]
         ),
+        .executable(
+            name: "scribby-coreml-diagnose",
+            targets: ["SwiftWhisperCoreMLDiagnose"]
+        ),
     ],
     dependencies: [
         .package(
@@ -30,6 +34,10 @@ let package = Package(
         ),
         .executableTarget(
             name: "SwiftWhisperHeadless",
+            dependencies: ["SwiftWhisperCore"]
+        ),
+        .executableTarget(
+            name: "SwiftWhisperCoreMLDiagnose",
             dependencies: ["SwiftWhisperCore"]
         ),
     ]

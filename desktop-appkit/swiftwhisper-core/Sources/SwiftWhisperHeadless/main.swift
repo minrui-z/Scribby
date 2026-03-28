@@ -21,14 +21,17 @@ struct SwiftWhisperHeadlessCLI {
 
     private static func resolveRequest(arguments: [String]) throws -> SwiftWhisperRequest {
         guard arguments.count > 1 else {
-            throw SwiftWhisperCoreError.invalidRequest("用法：scribby-swiftwhisper-headless <audio_file> [language] [--diarize]")
+            throw SwiftWhisperCoreError.invalidRequest("用法：scribby-swiftwhisper-headless <audio_file> [language] [--diarize] [--no-coreml]")
         }
         let language = arguments.count > 2 ? arguments[2] : "auto"
-        let diarize = arguments.dropFirst(3).contains("--diarize")
+        let flags = arguments.dropFirst(3)
+        let diarize = flags.contains("--diarize")
+        let disableCoreML = flags.contains("--no-coreml")
         return SwiftWhisperRequest(
             audioFileURL: URL(fileURLWithPath: arguments[1]),
             languageCode: language,
-            diarize: diarize
+            diarize: diarize,
+            disableCoreML: disableCoreML
         )
     }
 }

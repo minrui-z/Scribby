@@ -17,16 +17,27 @@ struct RootView: View {
 
                 VStack {
                     Spacer()
-                    LiveStreamOverlay(lines: model.floatingLines)
+                    if model.isProofreadingStreaming {
+                        ProofreadingStreamOverlay(
+                            lines: model.proofreadingStreamLines,
+                            liveStatus: model.proofreadingLiveStatus
+                        )
                         .allowsHitTesting(false)
-                        .padding(.bottom, 42)
+                        .padding(.bottom, 108)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    } else {
+                        LiveStreamOverlay(lines: model.floatingLines)
+                            .allowsHitTesting(false)
+                            .padding(.bottom, 42)
+                            .transition(.opacity)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .animation(.easeInOut(duration: 0.28), value: model.isProofreadingStreaming)
 
                 VStack(spacing: 26) {
                     header(availableWidth: proxy.size.width)
                     content(availableHeight: proxy.size.height, availableWidth: proxy.size.width)
-                    footer
                 }
                 .frame(maxWidth: .infinity, alignment: .top)
                 .frame(maxHeight: .infinity, alignment: .top)
@@ -49,6 +60,12 @@ struct RootView: View {
                 if model.showModelManager {
                     modelManagerOverlay
                         .zIndex(4)
+                        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                }
+
+                if model.showOnboardingWizard {
+                    onboardingWizardOverlay
+                        .zIndex(5)
                         .transition(.opacity.combined(with: .scale(scale: 0.98)))
                 }
             }
@@ -391,6 +408,26 @@ struct RootView: View {
 
             if showControls {
                 VStack(alignment: .leading, spacing: 10) {
+                    if model.shouldShowFirstTranscriptionWarmupNotice {
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: "bolt.horizontal.circle")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(Color.accentColor)
+                            Text("首次轉譯會先準備高效能運算環境，開始時間會稍久。")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(secondaryInk)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 0)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                        .background(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(Color.white.opacity(0.32))
+                        )
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+
                     HStack(spacing: 12) {
                         if model.isPaused {
                             Button(action: model.togglePause) {
@@ -536,17 +573,6 @@ struct RootView: View {
         .frame(maxHeight: .infinity, alignment: .top)
         .padding(24)
         .surfaceCard(cornerRadius: 24, borderOpacity: 0.06)
-    }
-
-    private var footer: some View {
-        VStack(spacing: 6) {
-            Text("桌面版本地執行 ・ Beta 測試版 ・ 音訊不會離開您的電腦")
-            Text("Developed by 莊旻叡")
-        }
-        .font(.system(size: 13, weight: .medium))
-        .foregroundStyle(secondaryInk)
-        .frame(maxWidth: .infinity)
-        .padding(.top, 18)
     }
 
     private var settingsOverlay: some View {
@@ -746,14 +772,14 @@ struct RootView: View {
                     Text("AI 校稿（beta）")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundStyle(primaryInk)
-                    Text("轉譯完成後用本地 AI 模型校正文字。首次使用會自動下載約 1.5 GB 模型，需要 Apple Silicon。")
+                    Text("轉譯完成後用本地 AI 模型校正文字。若已在首次功能準備頁啟用，會先把執行環境準備好；模型會在第一次實際使用時下載，需要 Apple Silicon。")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(secondaryInk)
                         .fixedSize(horizontal: false, vertical: true)
 
                     ForEach(ProofreadingMode.allCases, id: \.rawValue) { mode in
                         Button {
-                            model.proofreadingMode = mode
+                            model.selectProofreadingMode(mode)
                         } label: {
                             HStack(spacing: 10) {
                                 Image(systemName: model.proofreadingMode == mode
@@ -782,12 +808,14 @@ struct RootView: View {
 
                 settingsCard(tinted: false) {
                     Button {
-                        model.showModelManager = true
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            model.showModelManager = true
+                        }
                     } label: {
                         HStack(spacing: 10) {
                             Image(systemName: "square.and.arrow.down")
                                 .font(.system(size: 15, weight: .medium))
-                            Text("管理模型")
+                            Text("資料管理")
                                 .font(.system(size: 14, weight: .semibold))
                             Spacer()
                             Image(systemName: "chevron.right")
@@ -798,6 +826,33 @@ struct RootView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                }
+
+                settingsCard(tinted: false) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("軟體資訊")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(primaryInk)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Scribby Beta")
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(primaryInk)
+                            Text(appVersionLine)
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(secondaryInk)
+                        }
+
+                        Text("桌面版本地執行，音訊不會離開您的電腦。轉譯、語者辨識、人聲加強與 AI 校稿都在本機完成；首次使用相關功能時，模型與執行環境會下載到 Application Support，Core ML encoder 也可能在本機編譯，不會打包進 app 本體。")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(secondaryInk)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        Text("Designed and developed by 莊旻叡")
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(secondaryInk)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
                 }
@@ -839,6 +894,18 @@ struct RootView: View {
         }
     }
 
+    private var onboardingWizardOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.18)
+                .ignoresSafeArea()
+
+            OnboardingWizardSheet(
+                model: model,
+                tokenURL: tokenURL
+            )
+        }
+    }
+
     private func settingsCard<Content: View>(
         tinted: Bool = true,
         @ViewBuilder content: () -> Content
@@ -852,6 +919,13 @@ struct RootView: View {
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .fill(Color.white.opacity(tinted ? 0.32 : 0.24))
         )
+    }
+
+    private var appVersionLine: String {
+        let bundle = Bundle.main
+        let shortVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "Beta"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? shortVersion
+        return "版本 \(shortVersion)（build \(build)）"
     }
 
     private func loadDroppedPaths(from providers: [NSItemProvider]) {
@@ -1012,6 +1086,572 @@ private struct HoverHintBubble: View {
     }
 }
 
+private struct OnboardingWizardSheet: View {
+    @ObservedObject var model: NativeAppModel
+    let tokenURL: URL
+
+    private let primaryInk = Color(red: 0.16, green: 0.14, blue: 0.12)
+    private let secondaryInk = Color(red: 0.34, green: 0.31, blue: 0.28)
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            header
+
+            Group {
+                switch model.onboardingStep {
+                case .enhancement:
+                    enhancementStep
+                case .model:
+                    modelStep
+                case .diarization:
+                    diarizationStep
+                case .proofreading:
+                    proofreadingStep
+                case .install:
+                    installStep
+                }
+            }
+
+            footer
+        }
+        .padding(24)
+        .frame(width: 620, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .fill(Color.white.opacity(0.90))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .stroke(Color.white.opacity(0.55), lineWidth: 1)
+                )
+        )
+        .shadow(color: Color.black.opacity(0.10), radius: 24, x: 0, y: 14)
+        .animation(.spring(response: 0.28, dampingFraction: 0.84), value: model.onboardingStep)
+        .animation(.spring(response: 0.28, dampingFraction: 0.84), value: model.onboardingSelection)
+        .animation(.easeInOut(duration: 0.24), value: model.onboardingPreparationProgress)
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                ForEach(OnboardingWizardStep.allCases, id: \.rawValue) { step in
+                    Capsule()
+                        .fill(step.rawValue <= model.onboardingStep.rawValue ? Color.accentColor.opacity(step == model.onboardingStep ? 0.95 : 0.36) : secondaryInk.opacity(0.18))
+                        .frame(height: 6)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("首次使用設定")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundStyle(primaryInk)
+                Text("第 \(model.onboardingStep.rawValue + 1) 步，共 \(OnboardingWizardStep.allCases.count) 步 · \(model.onboardingStep.title)")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.accentColor)
+                Text("相關功能皆在本機執行，音訊不會離開電腦。完成選擇後，系統會依設定開始準備環境。")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var enhancementStep: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("是否開啟人聲增強？")
+                .font(.system(size: 24, weight: .bold))
+                .foregroundStyle(primaryInk)
+
+            Text("人聲增強會在轉譯前先做降噪與增清，對嘈雜環境、收音偏小或背景有雜音的錄音通常有幫助。代價是會多一段前處理時間。")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(secondaryInk)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 12) {
+                booleanChoiceCard(
+                    isSelected: model.onboardingSelection.enableEnhancement == false,
+                    title: "暫不開啟",
+                    detail: "直接開始轉譯，速度最快，適合收音本來就很乾淨的音檔。"
+                ) {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                        model.onboardingSelection.enableEnhancement = false
+                    }
+                }
+
+                booleanChoiceCard(
+                    isSelected: model.onboardingSelection.enableEnhancement == true,
+                    title: "開啟人聲增強",
+                    detail: "會先做前處理，通常能提升吵雜錄音的可辨識度；短檔會多幾秒，長檔會依音檔長度增加。"
+                ) {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                        model.onboardingSelection.enableEnhancement = true
+                    }
+                }
+            }
+        }
+    }
+
+    private var modelStep: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("預設使用哪個模型？")
+                .font(.system(size: 24, weight: .bold))
+                .foregroundStyle(primaryInk)
+
+            Text("之後仍可在設定切換，這裡只決定初始預設。")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(secondaryInk)
+
+            VStack(spacing: 12) {
+                ForEach(WhisperModelPreset.allCases, id: \.rawValue) { preset in
+                    Button {
+                        withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                            model.onboardingSelection.selectedModelPreset = preset
+                        }
+                    } label: {
+                        HStack(alignment: .top, spacing: 14) {
+                            Image(systemName: model.onboardingSelection.selectedModelPreset == preset ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundStyle(model.onboardingSelection.selectedModelPreset == preset ? Color.accentColor : secondaryInk)
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 8) {
+                                    Text(preset.displayName)
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundStyle(primaryInk)
+                                    if let badge = preset.onboardingBadge {
+                                        Text(badge)
+                                            .font(.system(size: 11, weight: .bold))
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 4)
+                                            .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+                                            .foregroundStyle(Color.accentColor)
+                                    }
+                                }
+                                Text("\(preset.sizeHint) · \(preset.onboardingDescription)")
+                                    .font(.system(size: 13, weight: .medium))
+                                    .foregroundStyle(secondaryInk)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer()
+                        }
+                        .padding(16)
+                        .background(choiceBackground(isSelected: model.onboardingSelection.selectedModelPreset == preset))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var diarizationStep: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("是否開啟語者辨識？")
+                .font(.system(size: 24, weight: .bold))
+                .foregroundStyle(primaryInk)
+
+            Text("語者辨識可區分不同說話者，例如「說話者 1 / 說話者 2」。需要 Hugging Face Token 來取得 pyannote 授權。")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(secondaryInk)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 12) {
+                booleanChoiceCard(
+                    isSelected: model.onboardingSelection.enableDiarization == false,
+                    title: "暫不開啟",
+                    detail: "先用一般逐字稿，之後隨時可在設定補開。"
+                ) {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                        model.onboardingSelection.enableDiarization = false
+                    }
+                }
+
+                booleanChoiceCard(
+                    isSelected: model.onboardingSelection.enableDiarization == true,
+                    title: "開啟語者辨識",
+                    detail: "適合多人對話、會議或訪談。Token 只是取得授權，不會有任何費用，資料也不會傳上去。"
+                ) {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                        model.onboardingSelection.enableDiarization = true
+                    }
+                }
+            }
+
+            if model.onboardingSelection.enableDiarization == true {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("如何拿到 Token")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(primaryInk)
+                    Text("1. 到 Hugging Face 建立 Access Token。\n2. 到 pyannote 模型頁完成授權。\n3. 將 Token 貼回此處即可。也可先略過，之後再補。")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(secondaryInk)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    TextField("貼上 Hugging Face Token（可先略過）", text: $model.onboardingSelection.pendingDiarizationToken)
+                        .textFieldStyle(.plain)
+                        .foregroundStyle(primaryInk)
+                        .tint(primaryInk)
+                        .padding(.horizontal, 12)
+                        .frame(height: 38)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(Color.white.opacity(0.75))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                        .stroke(Color.black.opacity(0.08), lineWidth: 1)
+                                )
+                        )
+                        .onChange(of: model.onboardingSelection.pendingDiarizationToken) { _ in
+                            if model.onboardingSelection.pendingDiarizationToken.count > 96 {
+                                model.onboardingSelection.pendingDiarizationToken = String(model.onboardingSelection.pendingDiarizationToken.prefix(96))
+                            }
+                            model.onboardingTokenStatus = ""
+                            model.onboardingTokenStatusTone = .neutral
+                        }
+
+                    HStack(spacing: 10) {
+                        Button {
+                            model.verifyOnboardingToken()
+                        } label: {
+                            HStack(spacing: 8) {
+                                if model.isVerifyingOnboardingToken {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                        .tint(.white)
+                                }
+                                Text(tokenVerificationButtonTitle)
+                                    .font(.system(size: 13, weight: .semibold))
+                            }
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .fill(tokenVerificationButtonColor)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                    .stroke(tokenVerificationButtonColor.opacity(0.22), lineWidth: 1)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(model.onboardingSelection.pendingDiarizationToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .opacity(model.onboardingSelection.pendingDiarizationToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.55 : 1)
+
+                        Button("取得 Token") {
+                            NSWorkspace.shared.open(tokenURL)
+                        }
+                        .buttonStyle(SecondaryActionButtonStyle())
+
+                        Spacer(minLength: 0)
+                    }
+                }
+                .padding(16)
+                .background(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .fill(Color.white.opacity(0.32))
+                )
+            }
+        }
+    }
+
+    private var proofreadingStep: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("是否開啟 AI 校稿？")
+                .font(.system(size: 24, weight: .bold))
+                .foregroundStyle(primaryInk)
+
+            Text("AI 校稿會在轉譯完成後用本地模型修正文字。第一次實際使用時會下載約 2.6 GB 模型，整段過程仍然在本機完成。")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(secondaryInk)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 12) {
+                booleanChoiceCard(
+                    isSelected: model.onboardingSelection.enableProofreading == false,
+                    title: "暫不開啟",
+                    detail: "先保留原始轉寫結果，不另外建立 AI 校稿環境。"
+                ) {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                        model.onboardingSelection.enableProofreading = false
+                    }
+                }
+
+                booleanChoiceCard(
+                    isSelected: model.onboardingSelection.enableProofreading == true,
+                    title: "開啟 AI 校稿",
+                    detail: "可讓逐字稿更通順，並修正明顯辨識錯字。"
+                ) {
+                    withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                        model.onboardingSelection.enableProofreading = true
+                        if model.onboardingSelection.proofreadingMode == .off {
+                            model.onboardingSelection.proofreadingMode = .standard
+                        }
+                    }
+                }
+            }
+
+            if model.onboardingSelection.enableProofreading == true {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("校稿模式")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(primaryInk)
+
+                    VStack(spacing: 10) {
+                        ForEach(ProofreadingMode.allCases.filter { $0 != .off }, id: \.rawValue) { mode in
+                            Button {
+                                withAnimation(.spring(response: 0.26, dampingFraction: 0.82)) {
+                                    model.onboardingSelection.proofreadingMode = mode
+                                }
+                            } label: {
+                                HStack(alignment: .top, spacing: 12) {
+                                    Image(systemName: model.onboardingSelection.proofreadingMode == mode ? "checkmark.circle.fill" : "circle")
+                                        .font(.system(size: 17, weight: .semibold))
+                                        .foregroundStyle(model.onboardingSelection.proofreadingMode == mode ? Color.accentColor : secondaryInk)
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(mode.displayName)
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(primaryInk)
+                                        Text(mode.description)
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundStyle(secondaryInk)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                    Spacer()
+                                }
+                                .padding(14)
+                                .background(choiceBackground(isSelected: model.onboardingSelection.proofreadingMode == mode))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var installStep: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("正在依照選擇準備環境")
+                .font(.system(size: 24, weight: .bold))
+                .foregroundStyle(primaryInk)
+
+            Text("此步驟會先把所需模型與功能環境一次準備完成。")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(secondaryInk)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("安裝進度")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(primaryInk)
+                    Spacer()
+                    Text("\(Int(model.onboardingPreparationProgress * 100))%")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                }
+
+                ProgressView(value: model.onboardingPreparationProgress, total: 1)
+                    .progressViewStyle(.linear)
+                    .tint(Color.accentColor)
+                    .scaleEffect(y: 1.4)
+
+                if model.isPreparingOnboardingChoices && !model.onboardingPreparationStatus.isEmpty {
+                    Text(model.onboardingPreparationStatus)
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(model.isPreparingOnboardingChoices ? Color.accentColor : secondaryInk)
+                        .lineLimit(2)
+                }
+            }
+            .padding(16)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color.white.opacity(0.34))
+            )
+
+            VStack(alignment: .leading, spacing: 12) {
+                installStateRow(
+                    key: "whisper",
+                    title: "轉譯模型",
+                    enabled: true,
+                    detail: "下載並準備轉譯所需模型"
+                )
+                installStateRow(
+                    key: "enhancement",
+                    title: "人聲增強",
+                    enabled: model.onboardingSelection.enableEnhancement == true,
+                    detail: "建立 enhancement 環境"
+                )
+                installStateRow(
+                    key: "diarization",
+                    title: "語者辨識",
+                    enabled: model.onboardingSelection.enableDiarization == true,
+                    detail: model.onboardingSelection.pendingDiarizationToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "已選擇，但尚未填 Token，安裝時會先略過授權準備"
+                        : "建立 diarization 環境",
+                )
+                installStateRow(
+                    key: "proofreading",
+                    title: "AI 校稿",
+                    enabled: model.onboardingSelection.enableProofreading == true,
+                    detail: "建立 proofreading 環境並下載模型"
+                )
+            }
+
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 10) {
+            Button(model.onboardingStep == .install ? "之後再說" : "稍後再說") {
+                model.skipOnboardingWizard()
+            }
+            .buttonStyle(SecondaryActionButtonStyle())
+            .disabled(model.isPreparingOnboardingChoices)
+
+            Spacer(minLength: 0)
+
+            if model.onboardingStep != .enhancement && model.onboardingStep != .install {
+                Button("上一步") {
+                    model.goToPreviousOnboardingStep()
+                }
+                .buttonStyle(SecondaryActionButtonStyle())
+            }
+
+            if model.onboardingStep == .install {
+                Button(model.isPreparingOnboardingChoices ? "準備中..." : "完成") {
+                    model.completeOnboardingWizard()
+                }
+                .buttonStyle(PrimaryActionButtonStyle(enabled: model.canAdvanceCurrentOnboardingStep))
+                .frame(width: 144)
+                .disabled(!model.canAdvanceCurrentOnboardingStep)
+            } else if model.onboardingStep == .proofreading {
+                Button("開始準備") {
+                    model.beginOnboardingPreparation()
+                }
+                .buttonStyle(PrimaryActionButtonStyle(enabled: model.canAdvanceCurrentOnboardingStep))
+                .frame(width: 144)
+                .disabled(!model.canAdvanceCurrentOnboardingStep)
+            } else {
+                Button("下一步") {
+                    model.goToNextOnboardingStep()
+                }
+                .buttonStyle(PrimaryActionButtonStyle(enabled: model.canAdvanceCurrentOnboardingStep))
+                .frame(width: 144)
+                .disabled(!model.canAdvanceCurrentOnboardingStep)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private func booleanChoiceCard(
+        isSelected: Bool,
+        title: String,
+        detail: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(alignment: .top, spacing: 14) {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(isSelected ? Color.accentColor : secondaryInk)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(primaryInk)
+                    Text(detail)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(secondaryInk)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+            }
+            .padding(16)
+            .background(choiceBackground(isSelected: isSelected))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func installStateRow(
+        key: String,
+        title: String,
+        enabled: Bool,
+        detail: String
+    ) -> some View {
+        let isCompleted = model.onboardingCompletedPreparationGroups.contains(key)
+        let isActive = model.onboardingActivePreparationGroup == key && !isCompleted
+        return HStack(alignment: .top, spacing: 12) {
+            Image(systemName: enabled ? (isCompleted ? "checkmark.circle.fill" : (isActive ? "arrow.triangle.2.circlepath.circle.fill" : "circle")) : "minus.circle")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(enabled ? (isCompleted ? Color(red: 0.14, green: 0.53, blue: 0.24) : (isActive ? Color.accentColor : secondaryInk.opacity(0.9))) : secondaryInk.opacity(0.8))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(primaryInk)
+                Text(enabled ? (isCompleted ? "已完成" : (isActive ? "準備中" : detail)) : "這次先不準備")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(enabled ? 0.34 : 0.18))
+        )
+        .animation(.easeInOut(duration: 0.22), value: isCompleted)
+        .animation(.easeInOut(duration: 0.22), value: isActive)
+    }
+
+    private func choiceBackground(isSelected: Bool) -> some View {
+        RoundedRectangle(cornerRadius: 20, style: .continuous)
+            .fill(isSelected ? Color.accentColor.opacity(0.10) : Color.white.opacity(0.24))
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(isSelected ? Color.accentColor.opacity(0.28) : Color.black.opacity(0.06), lineWidth: 1)
+            )
+    }
+
+    private func statusColor(_ tone: StatusTone) -> Color {
+        switch tone {
+        case .neutral: return secondaryInk
+        case .success: return Color(red: 0.14, green: 0.53, blue: 0.24)
+        case .error: return Color(red: 0.74, green: 0.20, blue: 0.16)
+        }
+    }
+
+    private var tokenVerificationButtonTitle: String {
+        if model.isVerifyingOnboardingToken {
+            return "驗證中"
+        }
+        switch model.onboardingTokenStatusTone {
+        case .success:
+            return "已驗證"
+        case .error:
+            return "驗證失敗"
+        case .neutral:
+            return "驗證 Token"
+        }
+    }
+
+    private var tokenVerificationButtonColor: Color {
+        if model.isVerifyingOnboardingToken {
+            return Color.accentColor.opacity(0.9)
+        }
+        switch model.onboardingTokenStatusTone {
+        case .success:
+            return Color(red: 0.14, green: 0.53, blue: 0.24)
+        case .error:
+            return Color(red: 0.74, green: 0.20, blue: 0.16)
+        case .neutral:
+            return secondaryInk
+        }
+    }
+}
+
 private struct WindowDragBlocker: ViewModifier {
     @ObservedObject var model: NativeAppModel
     @State private var isDraggingControl = false
@@ -1112,7 +1752,7 @@ private struct QueueRow: View {
                         activePhases: item.activePhases
                     )
 
-                    if let dl = item.downloadProgress, item.phase == .downloading {
+                    if let dl = item.downloadProgress {
                         DownloadInfoCard(info: dl)
                             .transition(.move(edge: .top).combined(with: .opacity))
                     }
@@ -1545,6 +2185,85 @@ private struct LiveStreamOverlay: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+    }
+}
+
+private struct ProofreadingStreamOverlay: View {
+    let lines: [ProofreadingStreamLineModel]
+    let liveStatus: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(Color.accentColor.opacity(0.92))
+                    .frame(width: 8, height: 8)
+                    .overlay(
+                        Circle()
+                            .stroke(Color.accentColor.opacity(0.18), lineWidth: 6)
+                            .scaleEffect(1.2)
+                    )
+                Text("AI 校稿中")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Color(red: 0.46, green: 0.42, blue: 0.38))
+                Spacer(minLength: 0)
+            }
+
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(lines.suffix(4).enumerated()), id: \.element.id) { index, line in
+                        Text(line.text)
+                            .font(.system(size: 13, weight: index == max(lines.suffix(4).count - 1, 0) ? .medium : .regular))
+                            .foregroundStyle(Color(red: 0.20, green: 0.18, blue: 0.15).opacity(index == max(lines.suffix(4).count - 1, 0) ? 0.92 : 0.62))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 96)
+
+            if !liveStatus.isEmpty {
+                HStack(spacing: 6) {
+                    Text(liveStatus)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Color(red: 0.16, green: 0.14, blue: 0.12))
+                        .lineLimit(1)
+                    BlinkingCursor()
+                    Spacer(minLength: 0)
+                }
+                .transition(.opacity)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .frame(width: 420, height: 178, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color.white.opacity(0.84))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(Color.white.opacity(0.55), lineWidth: 1)
+                )
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 14, x: 0, y: 8)
+    }
+}
+
+private struct BlinkingCursor: View {
+    @State private var visible = true
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+            .fill(Color.accentColor.opacity(0.92))
+            .frame(width: 10, height: 18)
+            .opacity(visible ? 1 : 0.18)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.62).repeatForever(autoreverses: true)) {
+                    visible = false
+                }
+            }
     }
 }
 

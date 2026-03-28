@@ -6,9 +6,11 @@ import SwiftUI
 @MainActor
 final class ModelManagerViewModel: ObservableObject {
     @Published var models: [ManagedModel] = []
+    @Published var storageItems: [ManagedStorageItem] = []
     @Published var downloadStates: [String: ModelDownloadState] = [:]
     @Published var isScanning = true
     @Published var errorMessage: String?
+    @Published var appSupportFootprint: Int64 = 0
 
     private var downloadTasks: [String: Task<Void, Never>] = [:]
 
@@ -20,14 +22,39 @@ final class ModelManagerViewModel: ObservableObject {
         ByteCountFormatter.string(fromByteCount: totalDownloadedSize, countStyle: .file)
     }
 
+    var totalStorageSize: Int64 {
+        ModelCatalog.shared.totalStorageSize(from: storageItems)
+    }
+
+    var formattedStorageSize: String {
+        ByteCountFormatter.string(fromByteCount: totalStorageSize, countStyle: .file)
+    }
+
+    var formattedAppSupportFootprint: String {
+        ByteCountFormatter.string(fromByteCount: appSupportFootprint, countStyle: .file)
+    }
+
     func scan() async {
-        isScanning = true
-        do {
-            models = try await ModelCatalog.shared.scan()
-        } catch {
-            errorMessage = "掃描失敗：\(error.localizedDescription)"
+        withAnimation(.easeInOut(duration: 0.18)) {
+            isScanning = true
         }
-        isScanning = false
+        do {
+            let scannedModels = try await ModelCatalog.shared.scan()
+            let scannedStorage = try await ModelCatalog.shared.scanStorageItems()
+            let footprint = try await ModelCatalog.shared.appSupportFootprint()
+            withAnimation(.spring(response: 0.34, dampingFraction: 0.86)) {
+                models = scannedModels
+                storageItems = scannedStorage
+                appSupportFootprint = footprint
+            }
+        } catch {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                errorMessage = "掃描失敗：\(error.localizedDescription)"
+            }
+        }
+        withAnimation(.easeInOut(duration: 0.18)) {
+            isScanning = false
+        }
     }
 
     func downloadState(for model: ManagedModel) -> ModelDownloadState {
@@ -51,7 +78,9 @@ final class ModelManagerViewModel: ObservableObject {
     func cancelDownload(_ model: ManagedModel) {
         downloadTasks[model.id]?.cancel()
         downloadTasks[model.id] = nil
-        downloadStates[model.id] = .idle
+        withAnimation(.easeInOut(duration: 0.18)) {
+            downloadStates[model.id] = .idle
+        }
     }
 
     func delete(_ model: ManagedModel) async {
@@ -63,12 +92,23 @@ final class ModelManagerViewModel: ObservableObject {
         }
     }
 
+    func delete(_ item: ManagedStorageItem) async {
+        do {
+            try await ModelCatalog.shared.delete(item)
+            await scan()
+        } catch {
+            errorMessage = "清理失敗：\(error.localizedDescription)"
+        }
+    }
+
     // MARK: - Whisper Download
 
     private func downloadWhisper(model: ManagedModel, preset: WhisperModelPreset) async {
         guard let remoteURL = URL(string: preset.remoteURL) else { return }
 
-        downloadStates[model.id] = .downloading(progress: 0, bytesDownloaded: 0, totalBytes: 0)
+        withAnimation(.easeInOut(duration: 0.18)) {
+            downloadStates[model.id] = .downloading(progress: 0, bytesDownloaded: 0, totalBytes: 0)
+        }
 
         do {
             let modelDir = try PathResolver.swiftWhisperModelDirectory()
@@ -80,19 +120,27 @@ final class ModelManagerViewModel: ObservableObject {
                 modelId: model.id
             )
 
-            downloadStates[model.id] = .idle
+            withAnimation(.easeInOut(duration: 0.18)) {
+                downloadStates[model.id] = .idle
+            }
             await scan()
         } catch is CancellationError {
-            downloadStates[model.id] = .idle
+            withAnimation(.easeInOut(duration: 0.18)) {
+                downloadStates[model.id] = .idle
+            }
         } catch {
-            downloadStates[model.id] = .failed(error.localizedDescription)
+            withAnimation(.easeInOut(duration: 0.18)) {
+                downloadStates[model.id] = .failed(error.localizedDescription)
+            }
         }
     }
 
     // MARK: - LLM Download
 
     private func downloadLLM(model: ManagedModel, spec: LLMModelSpec) async {
-        downloadStates[model.id] = .installing
+        withAnimation(.easeInOut(duration: 0.18)) {
+            downloadStates[model.id] = .installing
+        }
 
         do {
             // Step 1: Ensure Python env with mlx-lm is ready
@@ -150,13 +198,19 @@ final class ModelManagerViewModel: ObservableObject {
                 )
             }
 
-            downloadStates[model.id] = .idle
+            withAnimation(.easeInOut(duration: 0.18)) {
+                downloadStates[model.id] = .idle
+            }
             await scan()
 
         } catch is CancellationError {
-            downloadStates[model.id] = .idle
+            withAnimation(.easeInOut(duration: 0.18)) {
+                downloadStates[model.id] = .idle
+            }
         } catch {
-            downloadStates[model.id] = .failed(error.localizedDescription)
+            withAnimation(.easeInOut(duration: 0.18)) {
+                downloadStates[model.id] = .failed(error.localizedDescription)
+            }
         }
     }
 
@@ -173,11 +227,13 @@ final class ModelManagerViewModel: ObservableObject {
                     onProgress: { [weak self] downloaded, total in
                         Task { @MainActor [weak self] in
                             let progress = total > 0 ? Double(downloaded) / Double(total) : 0
-                            self?.downloadStates[modelId] = .downloading(
-                                progress: progress,
-                                bytesDownloaded: downloaded,
-                                totalBytes: total
-                            )
+                            withAnimation(.linear(duration: 0.14)) {
+                                self?.downloadStates[modelId] = .downloading(
+                                    progress: progress,
+                                    bytesDownloaded: downloaded,
+                                    totalBytes: total
+                                )
+                            }
                         }
                     },
                     continuation: continuation
@@ -264,10 +320,10 @@ struct ModelManagerSheet: View {
             // Header
             HStack(alignment: .center) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("模型管理")
+                    Text("資料管理")
                         .font(.system(size: 20, weight: .bold))
                         .foregroundStyle(primaryInk)
-                    Text("下載或刪除本機的 AI 模型")
+                    Text("管理本機模型、快取與環境資料")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(secondaryInk)
                 }
@@ -287,10 +343,13 @@ struct ModelManagerSheet: View {
                 Spacer()
                 ProgressView()
                     .scaleEffect(0.8)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 Spacer()
             } else {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 0) {
+                        storageOverview
+
                         // Whisper section
                         sectionHeader("Whisper 轉寫模型")
                         ForEach(vm.models.filter { if case .whisper = $0.kind { return true }; return false }) { model in
@@ -304,19 +363,27 @@ struct ModelManagerSheet: View {
                             modelRow(model)
                             Divider().padding(.leading, 24).opacity(0.1)
                         }
+
+                        if !vm.storageItems.isEmpty {
+                            sectionHeader("快取與環境")
+                            ForEach(vm.storageItems) { item in
+                                storageRow(item)
+                                Divider().padding(.leading, 24).opacity(0.1)
+                            }
+                        }
                     }
+                    .animation(.spring(response: 0.34, dampingFraction: 0.86), value: vm.models)
+                    .animation(.spring(response: 0.34, dampingFraction: 0.86), value: vm.storageItems)
+                    .animation(.easeInOut(duration: 0.18), value: vm.downloadStates)
                 }
+                .transition(.opacity)
 
                 // Footer: total size
                 Divider().opacity(0.15)
-                HStack {
-                    Text("已下載模型共佔用")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(secondaryInk)
-                    Text(vm.formattedTotalSize)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(primaryInk)
-                    Spacer()
+                VStack(alignment: .leading, spacing: 6) {
+                    footerMetricRow(label: "模型占用", value: vm.formattedTotalSize)
+                    footerMetricRow(label: "快取與環境", value: vm.formattedStorageSize)
+                    footerMetricRow(label: "Scribby 總占用", value: vm.formattedAppSupportFootprint)
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 14)
@@ -331,7 +398,7 @@ struct ModelManagerSheet: View {
                     .padding(.bottom, 12)
             }
         }
-        .frame(width: 460, height: 520)
+        .frame(width: 520, height: 620)
         .background(
             RoundedRectangle(cornerRadius: 28, style: .continuous)
                 .fill(paperBackground)
@@ -344,9 +411,24 @@ struct ModelManagerSheet: View {
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .preferredColorScheme(.light)
         .task { await vm.scan() }
+        .animation(.easeInOut(duration: 0.2), value: vm.isScanning)
+        .animation(.easeInOut(duration: 0.2), value: vm.errorMessage)
     }
 
     // MARK: - Section Header
+
+    private var storageOverview: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("目前 Scribby 的模型、Python 環境和舊版殘留都在這裡集中管理。刪除模型或快取後，下次使用時會重新下載或重建。")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(secondaryInk)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 24)
+        .padding(.top, 18)
+        .padding(.bottom, 8)
+    }
 
     private func sectionHeader(_ title: String) -> some View {
         Text(title)
@@ -377,6 +459,8 @@ struct ModelManagerSheet: View {
                     .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(primaryInk)
 
+                badge(model.kind.cleanupBadge, tint: Color.accentColor.opacity(0.14), ink: Color.accentColor.opacity(0.92))
+
                 if case .downloading(let progress, let downloaded, let total) = state {
                     downloadProgressRow(progress: progress, downloaded: downloaded, total: total)
                 } else if case .installing = state {
@@ -405,6 +489,51 @@ struct ModelManagerSheet: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 12)
         .contentShape(Rectangle())
+        .transition(.asymmetric(
+            insertion: .opacity.combined(with: .move(edge: .top)),
+            removal: .opacity.combined(with: .scale(scale: 0.96))
+        ))
+    }
+
+    @ViewBuilder
+    private func storageRow(_ item: ManagedStorageItem) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: item.kind.symbolName)
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(secondaryInk.opacity(0.65))
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(item.kind.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(primaryInk)
+
+                badge(item.kind.cleanupBadge, tint: Color(red: 0.39, green: 0.33, blue: 0.25).opacity(0.12), ink: secondaryInk)
+
+                Text(item.kind.subtitle)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(secondaryInk)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text(item.formattedSizeOnDisk)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(primaryInk.opacity(0.82))
+            }
+
+            Spacer()
+
+            Button("清理") {
+                Task { await vm.delete(item) }
+            }
+            .buttonStyle(DestructiveSmallButtonStyle())
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 12)
+        .contentShape(Rectangle())
+        .transition(.asymmetric(
+            insertion: .opacity.combined(with: .move(edge: .top)),
+            removal: .opacity.combined(with: .scale(scale: 0.96))
+        ))
     }
 
     @ViewBuilder
@@ -413,12 +542,14 @@ struct ModelManagerSheet: View {
             ProgressView(value: progress)
                 .frame(maxWidth: 160)
                 .tint(Color.accentColor)
+                .animation(.linear(duration: 0.14), value: progress)
             if total > 0 {
                 let dlStr = ByteCountFormatter.string(fromByteCount: downloaded, countStyle: .file)
                 let totalStr = ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
                 Text("\(dlStr) / \(totalStr)")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(secondaryInk)
+                    .contentTransition(.numericText())
             }
         }
     }
@@ -461,6 +592,32 @@ struct ModelManagerSheet: View {
         case .whisper: return "waveform"
         case .llm: return "sparkles"
         }
+    }
+
+    private func footerMetricRow(label: String, value: String) -> some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(secondaryInk)
+            Text(value)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(primaryInk)
+                .contentTransition(.numericText())
+            Spacer()
+        }
+    }
+
+    private func badge(_ text: String, tint: Color, ink: Color) -> some View {
+        Text(text)
+            .font(.system(size: 10, weight: .semibold))
+            .foregroundStyle(ink)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(tint)
+            )
+            .fixedSize()
     }
 }
 
